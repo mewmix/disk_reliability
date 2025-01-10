@@ -1,0 +1,9 @@
+[package]
+name = "disk_tester"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+winapi = { version = "0.3", features = ["fileapi", "winnt", "minwindef"] }
+indicatif = "0.17"   # For a progress bar
+libc = "0.2"
