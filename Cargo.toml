@@ -7,3 +7,4 @@ edition = "2021"
 winapi = { version = "0.3", features = ["fileapi", "winnt", "minwindef"] }
 indicatif = "0.17"   # For a progress bar
 libc = "0.2"
+ctrlc = "3.4.5"
