@@ -234,19 +234,31 @@ fn single_sector_read(
         return Err(e);
     }
 
-    // Show a small hex preview
-    let preview_len = std::cmp::min(16, buffer.len());
-    let preview = &buffer[..preview_len];
+    // Dump the entire block in hex
+    // To improve readability, format the hex dump in a more structured way
+    let hex_dump = buffer
+        .chunks(16) // Split into chunks of 16 bytes for better readability
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|byte| format!("{:02X}", byte))
+                .collect::<Vec<String>>()
+                .join(" ")
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+
     log_simple(
         log_file_arc,
         format!(
-            "Read {} bytes @ sector {}. First {} bytes in hex: {:02X?}",
-            block_size, sector, preview_len, preview
+            "Read {} bytes @ sector {}.\nHex Dump:\n{}",
+            block_size, sector, hex_dump
         ),
     );
 
     Ok(())
 }
+
 
 /// Range Read (--range-read)
 fn range_read(
@@ -662,7 +674,7 @@ fn main() -> io::Result<()> {
     )?;
 
     // Summarize reliability results
-    let c = counters_arc.lock().unwrap();
+    let c = counters_arc.lock().unwrap  ();
     let total_errors = c.write_errors + c.read_errors + c.mismatches;
     log_simple(
         &log_file_arc,
