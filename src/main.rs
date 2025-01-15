@@ -183,6 +183,7 @@ fn save_metadata(path: &Path, meta: &TestMeta) -> io::Result<()> {
     serde_json::to_writer_pretty(&f, meta)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "Serialization error"))?;
     f.sync_all()?;
+    Ok(()) // **Added Ok(()) to signify successful completion**
 }
 
 #[cfg(target_family = "unix")]
@@ -401,7 +402,7 @@ fn full_reliability_test(
     log_simple(
         log_file_arc,
         format!("Full test size: {:.2} {}", ds, du),
-    )?;
+    ); // **Removed '?' operator**
 
     // Pre-allocate test file
     let f = OpenOptions::new()
@@ -418,7 +419,7 @@ fn full_reliability_test(
     log_simple(
         log_file_arc,
         format!("Full reliability test => total sectors: {}", total_sectors),
-    )?;
+    ); // **Removed '?' operator**
 
     // We'll time the concurrency test
     let start_time = Instant::now();
@@ -458,7 +459,7 @@ fn full_reliability_test(
         }
 
         // Adjust for resume data
-        let start_sector = if start_sector as u64 < effective_start {
+        let start_sector = if (start_sector as u64) < effective_start { // **Added parentheses**
             effective_start as usize
         } else {
             start_sector
@@ -503,7 +504,7 @@ fn full_reliability_test(
                 if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes))
                     .and_then(|_| file_guard.write_all(&write_buf[..current_batch_size * block_size]))
                 {
-                    log_error(&log_clone, thread_idx, sector as u64, "Write Error", &e).ok();
+                    log_error(&log_clone, thread_idx, sector as u64, "Write Error", &e);
                     counters_clone.increment_write_errors();
                     HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                     break;
@@ -513,7 +514,7 @@ fn full_reliability_test(
                 if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes))
                     .and_then(|_| file_guard.read_exact(&mut read_buf[..current_batch_size * block_size]))
                 {
-                    log_error(&log_clone, thread_idx, sector as u64, "Read Error", &e).ok();
+                    log_error(&log_clone, thread_idx, sector as u64, "Read Error", &e);
                     counters_clone.increment_read_errors();
                     HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                     break;
@@ -567,7 +568,7 @@ fn full_reliability_test(
     log_simple(
         log_file_arc,
         format!("Full reliability test completed in {duration:?}"),
-    )?;
+    ); // **Removed '?' operator**
 
     // Optionally, return an error if any fatal errors were encountered
     if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
@@ -761,8 +762,8 @@ fn main() -> io::Result<()> {
 
     // Summarize reliability results
     let c = counters_arc;
-    let total_errors = c.write_errors.load(Ordering::Relaxed) 
-        + c.read_errors.load(Ordering::Relaxed) 
+    let total_errors = c.write_errors.load(Ordering::Relaxed)
+        + c.read_errors.load(Ordering::Relaxed)
         + c.mismatches.load(Ordering::Relaxed);
     log_simple(
         &log_file_arc,
