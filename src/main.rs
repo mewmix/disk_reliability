@@ -1,12 +1,13 @@
 //! src/main.rs
 
+use std::cmp;
 use std::env;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -35,9 +36,31 @@ static HAS_FATAL_ERROR: AtomicBool = AtomicBool::new(false); // For catastrophic
 /// Tracks error counts for the reliability test
 #[derive(Default)]
 struct ErrorCounters {
-    write_errors: usize,
-    read_errors: usize,
-    mismatches: usize,
+    write_errors: AtomicUsize,
+    read_errors: AtomicUsize,
+    mismatches: AtomicUsize,
+}
+
+impl ErrorCounters {
+    fn new() -> Self {
+        Self {
+            write_errors: AtomicUsize::new(0),
+            read_errors: AtomicUsize::new(0),
+            mismatches: AtomicUsize::new(0),
+        }
+    }
+
+    fn increment_write_errors(&self) {
+        self.write_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_read_errors(&self) {
+        self.read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_mismatches(&self) {
+        self.mismatches.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Metadata for resume
@@ -160,8 +183,8 @@ fn save_metadata(path: &Path, meta: &TestMeta) -> io::Result<()> {
     serde_json::to_writer_pretty(&f, meta)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "Serialization error"))?;
     f.sync_all()?;
-    Ok(())
 }
+
 #[cfg(target_family = "unix")]
 fn get_free_space(path: &std::path::Path) -> io::Result<u64> {
     use std::ffi::CString;
@@ -214,6 +237,7 @@ fn get_free_space(path: &std::path::Path) -> io::Result<u64> {
 
     Ok(unsafe { *(&free_bytes_available as *const _ as *const u64) })
 }
+
 /// Single-Sector Read (--read-sector)
 fn single_sector_read(
     log_file_arc: &Arc<Mutex<File>>,
@@ -258,7 +282,6 @@ fn single_sector_read(
 
     Ok(())
 }
-
 
 /// Range Read (--range-read)
 fn range_read(
@@ -342,17 +365,26 @@ fn range_write(
     Ok(())
 }
 
-/// Full-disk concurrency test (the original reliability test)
+/// Full-disk concurrency test (the optimized reliability test)
 fn full_reliability_test(
     file_path: &Path,
     log_file_arc: &Arc<Mutex<File>>,
-    counters_arc: &Arc<Mutex<ErrorCounters>>,
+    counters_arc: &Arc<ErrorCounters>,
     meta_path: Option<PathBuf>,
     resume_data: TestMeta,
     block_size: usize,
     num_threads: usize,
     data_type: DataType,
+    batch_size: usize, // Added
 ) -> io::Result<()> {
+    // Validate block_size to prevent division by zero
+    if block_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block_size cannot be zero",
+        ));
+    }
+
     // 1) Determine free space using the parent directory
     let parent_dir = file_path.parent().unwrap_or(Path::new("."));
     let free_space = get_free_space(parent_dir)?;
@@ -366,10 +398,17 @@ fn full_reliability_test(
 
     // For user feedback, display the final test size
     let (ds, du) = format_bytes(total_bytes as u64);
-    log_simple(log_file_arc, format!("Full test size: {:.2} {}", ds, du));
+    log_simple(
+        log_file_arc,
+        format!("Full test size: {:.2} {}", ds, du),
+    )?;
 
     // Pre-allocate test file
-    let f = OpenOptions::new().read(true).write(true).create(true).open(file_path)?;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(file_path)?;
     f.set_len(total_bytes as u64)?;
 
     // How many sectors
@@ -379,13 +418,13 @@ fn full_reliability_test(
     log_simple(
         log_file_arc,
         format!("Full reliability test => total sectors: {}", total_sectors),
-    );
+    )?;
 
     // We'll time the concurrency test
     let start_time = Instant::now();
 
     // Progress bar
-    let pb = ProgressBar::new(total_sectors as u64);
+    let pb = ProgressBar::new(end_sector);
     pb.set_style(
         ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
             .unwrap(),
@@ -399,12 +438,32 @@ fn full_reliability_test(
     // Put data_type behind an Arc so threads can access it
     let data_type_arc = Arc::new(data_type);
 
+    // Calculate sectors per thread for continuous ranges
+    let sectors_per_thread = total_sectors / num_threads;
+    let remaining_sectors = total_sectors % num_threads;
+
     for thread_idx in 0..num_threads {
         let log_clone = Arc::clone(log_file_arc);
         let counters_clone = Arc::clone(counters_arc);
         let pb_clone = Arc::clone(&pb_arc);
         let mp_clone = meta_path.clone();
         let dt_clone = Arc::clone(&data_type_arc);
+        let batch_size = batch_size; // Captured
+
+        // Calculate start and end sector for this thread
+        let start_sector = thread_idx * sectors_per_thread + cmp::min(thread_idx, remaining_sectors);
+        let mut end_sector_thread = start_sector + sectors_per_thread;
+        if thread_idx < remaining_sectors {
+            end_sector_thread += 1;
+        }
+
+        // Adjust for resume data
+        let start_sector = if start_sector as u64 < effective_start {
+            effective_start as usize
+        } else {
+            start_sector
+        };
+        let end_sector_thread = end_sector_thread.min(total_sectors);
 
         // Open a separate file handle for each thread
         let thread_file = OpenOptions::new()
@@ -414,67 +473,81 @@ fn full_reliability_test(
             .expect("Failed to open file in thread");
 
         let handle = thread::spawn(move || {
-            let mut sector_idx = thread_idx;
             let mut file_guard = thread_file;
-            let mut read_buf = vec![0u8; block_size];
+            let mut last_meta_update = start_sector;
 
-            while (sector_idx as u64) < end_sector && !STOP_REQUESTED.load(Ordering::SeqCst) {
-                if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
+            // Prepare buffers for batching
+            let mut write_buf = vec![0u8; batch_size * block_size];
+            let mut read_buf = vec![0u8; batch_size * block_size];
+
+            let mut sector = start_sector;
+            while sector < end_sector_thread {
+                if STOP_REQUESTED.load(Ordering::SeqCst) || HAS_FATAL_ERROR.load(Ordering::SeqCst) {
                     break;
                 }
 
-                let offset_sector = effective_start + sector_idx as u64;
-                if offset_sector >= end_sector {
-                    break;
+                // Determine the size of the current batch
+                let batch_end = cmp::min(sector + batch_size, end_sector_thread);
+                let current_batch_size = batch_end - sector;
+
+                // Fill the write buffer
+                for i in 0..current_batch_size {
+                    let current_sector = effective_start + (sector + i) as u64;
+                    write_buf[i * block_size..(i + 1) * block_size]
+                        .copy_from_slice(&dt_clone.fill_block(block_size, current_sector));
                 }
 
-                // Fill buffer
-                let write_buf = dt_clone.fill_block(block_size, offset_sector);
+                let offset_bytes = sector as u64 * block_size as u64;
 
-                let offset_bytes = offset_sector * block_size as u64;
-
-                // Seek + Write
-                if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes)).and_then(|_| file_guard.write_all(&write_buf)) {
-                    log_error(&log_clone, thread_idx, offset_sector, "Write Error", &e);
-                    counters_clone.lock().unwrap().write_errors += 1;
+                // Seek once for the entire batch write
+                if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes))
+                    .and_then(|_| file_guard.write_all(&write_buf[..current_batch_size * block_size]))
+                {
+                    log_error(&log_clone, thread_idx, sector as u64, "Write Error", &e).ok();
+                    counters_clone.increment_write_errors();
                     HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                     break;
                 }
 
-                // Seek + Read
-                if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes)).and_then(|_| file_guard.read_exact(&mut read_buf)) {
-                    log_error(&log_clone, thread_idx, offset_sector, "Read Error", &e);
-                    counters_clone.lock().unwrap().read_errors += 1;
+                // Seek once for the entire batch read
+                if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes))
+                    .and_then(|_| file_guard.read_exact(&mut read_buf[..current_batch_size * block_size]))
+                {
+                    log_error(&log_clone, thread_idx, sector as u64, "Read Error", &e).ok();
+                    counters_clone.increment_read_errors();
                     HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                     break;
                 }
 
                 // Verification
-                if write_buf != read_buf {
-                    let mut c = counters_clone.lock().unwrap();
-                    c.mismatches += 1;
-                    let msg = format!(
-                        "[THREAD {}] Mismatch @ sector {}. Ex: {:02X?} vs. {:02X?}",
-                        thread_idx,
-                        offset_sector,
-                        &write_buf[..std::cmp::min(8, write_buf.len())],
-                        &read_buf[..std::cmp::min(8, read_buf.len())],
-                    );
-                    log_simple(&log_clone, msg);
+                if &write_buf[..current_batch_size * block_size] != &read_buf[..current_batch_size * block_size] {
+                    counters_clone.increment_mismatches();
+                    // Optionally, you can aggregate mismatches and log them periodically
                 }
 
                 // Progress
-                pb_clone.inc(1);
+                pb_clone.inc(current_batch_size as u64);
 
-                // Metadata update
+                // Metadata update every 1000 sectors or at the end of the batch
                 if let Some(ref mp) = mp_clone {
-                    let new_meta = TestMeta {
-                        next_sector: offset_sector + 1,
-                    };
-                    let _ = save_metadata(mp, &new_meta);
+                    if (sector - last_meta_update) >= 1000 || sector + current_batch_size >= end_sector_thread {
+                        let new_meta = TestMeta {
+                            next_sector: (effective_start + sector as u64 + current_batch_size as u64).min(end_sector),
+                        };
+                        let _ = save_metadata(mp, &new_meta);
+                        last_meta_update = sector + current_batch_size;
+                    }
                 }
 
-                sector_idx += num_threads;
+                sector += current_batch_size;
+            }
+
+            // Final metadata update for this thread
+            if let Some(ref mp) = mp_clone {
+                let new_meta = TestMeta {
+                    next_sector: (effective_start + end_sector_thread as u64).min(end_sector),
+                };
+                let _ = save_metadata(mp, &new_meta);
             }
         });
         handles.push(handle);
@@ -494,7 +567,15 @@ fn full_reliability_test(
     log_simple(
         log_file_arc,
         format!("Full reliability test completed in {duration:?}"),
-    );
+    )?;
+
+    // Optionally, return an error if any fatal errors were encountered
+    if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Fatal errors occurred during the test",
+        ));
+    }
 
     Ok(())
 }
@@ -550,6 +631,10 @@ fn main() -> io::Result<()> {
     let block_size = get_arg_value(&args, "--block-size")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_BLOCK_SIZE);
+
+    let batch_size = get_arg_value(&args, "--batch-size") // Added
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100); // Default to 100 if not specified
 
     let meta_path = get_arg_value(&args, "--meta").map(PathBuf::from);
 
@@ -660,7 +745,7 @@ fn main() -> io::Result<()> {
     }
 
     // For concurrency test, track errors
-    let counters_arc = Arc::new(Mutex::new(ErrorCounters::default()));
+    let counters_arc = Arc::new(ErrorCounters::default());
 
     full_reliability_test(
         &file_path,
@@ -671,16 +756,22 @@ fn main() -> io::Result<()> {
         block_size,
         num_threads,
         data_type,
+        batch_size, // Added
     )?;
 
     // Summarize reliability results
-    let c = counters_arc.lock().unwrap  ();
-    let total_errors = c.write_errors + c.read_errors + c.mismatches;
+    let c = counters_arc;
+    let total_errors = c.write_errors.load(Ordering::Relaxed) 
+        + c.read_errors.load(Ordering::Relaxed) 
+        + c.mismatches.load(Ordering::Relaxed);
     log_simple(
         &log_file_arc,
         format!(
             "Final Reliability Summary: Write Errors={}, Read Errors={}, Mismatches={}, Total={}",
-            c.write_errors, c.read_errors, c.mismatches, total_errors
+            c.write_errors.load(Ordering::Relaxed),
+            c.read_errors.load(Ordering::Relaxed),
+            c.mismatches.load(Ordering::Relaxed),
+            total_errors
         ),
     );
 
