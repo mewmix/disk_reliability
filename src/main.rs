@@ -633,9 +633,9 @@ fn main() -> io::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_BLOCK_SIZE);
 
-    let batch_size = get_arg_value(&args, "--batch-size") // Added
+    let batch_size = get_arg_value(&args, "--batch-size") 
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100); // Default to 100 if not specified
+        .unwrap_or(1); // Default to 1 if not specified
 
     let meta_path = get_arg_value(&args, "--meta").map(PathBuf::from);
 
