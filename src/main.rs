@@ -1,5 +1,10 @@
 //! src/main.rs
 
+// Uncomment this if you'd like to keep using chrono for timestamps.
+// Make sure you add `chrono = "0.4"` to Cargo.toml.
+// use chrono::Local;
+
+use hostname;
 use std::cmp;
 use std::env;
 use std::fs;
@@ -11,12 +16,9 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-// Ctrl+C
 use ctrlc;
-
-// Progress bar
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Default constants
@@ -74,7 +76,6 @@ impl DataType {
     fn fill_block(&self, block_size: usize, offset_sector: u64) -> Vec<u8> {
         match self {
             DataType::Hex => {
-                // Cycle through b"0123456789ABCDEF"
                 let mut block = vec![0u8; block_size];
                 let pattern = b"0123456789ABCDEF";
                 for i in 0..block_size {
@@ -84,7 +85,6 @@ impl DataType {
                 block
             }
             DataType::Text => {
-                // Repeated ASCII text sample
                 let sample = b"Lorem ipsum dolor sit amet. ";
                 let mut block = vec![0u8; block_size];
                 for i in 0..block_size {
@@ -94,7 +94,6 @@ impl DataType {
                 block
             }
             DataType::Binary => {
-                // Pseudo-random numeric pattern
                 let mut block = vec![0u8; block_size];
                 for (i, b) in block.iter_mut().enumerate() {
                     *b = ((offset_sector as usize + i) % 256) as u8;
@@ -102,7 +101,6 @@ impl DataType {
                 block
             }
             DataType::File(buf) => {
-                // Repeat/truncate the loaded file data
                 let mut block = vec![0u8; block_size];
                 for i in 0..block_size {
                     let idx = (offset_sector as usize * block_size + i) % buf.len();
@@ -117,7 +115,7 @@ impl DataType {
 /// Setup graceful Ctrl+C
 fn setup_signal_handler() {
     ctrlc::set_handler(move || {
-        eprintln!("Received Ctrl+C; stopping...");
+        eprintln!("Received Ctrl+C; initiating graceful shutdown...");
         STOP_REQUESTED.store(true, Ordering::SeqCst);
     })
     .expect("Error setting Ctrl+C handler");
@@ -132,33 +130,68 @@ fn get_arg_value(args: &[String], key: &str) -> Option<String> {
     }
 }
 
-/// Log an error (both stderr and file)
+/// A simple helper to get a timestamp string without needing `chrono`.
+fn current_timestamp() -> String {
+    // If you prefer to omit timestamps entirely, just return an empty string here.
+    // Or, if using chrono, uncomment the line below:
+    // return Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Minimal approach using system time since UNIX EPOCH:
+    let now = std::time::SystemTime::now();
+    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!("T+{:.3}s", since_epoch.as_secs_f64())
+}
+
+/// Log an error (both stderr and file) with optional path.
+/// Data Mismatch, Read, Write errors will NOT terminate the test now; only log them.
 fn log_error(
     log_file_arc: &Arc<Mutex<File>>,
     thread_idx: usize,
     sector: u64,
     category: &str,
     err: &io::Error,
+    expected: Option<&[u8]>,
+    actual: Option<&[u8]>,
+    path: Option<PathBuf>, // Owned PathBuf to avoid lifetime issues
 ) {
-    eprintln!("[THREAD {}] {} at sector {}: {}", thread_idx, category, sector, err);
+    let ts = current_timestamp();
+    let mut error_message = format!(
+        "[{}] [THREAD {}] {} at sector {}: {}\n",
+        ts, thread_idx, category, sector, err
+    );
+
+    if let Some(p) = path {
+        error_message.push_str(&format!("Path: {}\n", p.display()));
+    }
+
+    if let (Some(exp), Some(act)) = (expected, actual) {
+        error_message.push_str(&format!(
+            "Expected: {:02X?}\nActual:   {:02X?}\n",
+            exp, act
+        ));
+    }
+
+    eprintln!("{}", error_message);
     if let Ok(mut lf) = log_file_arc.lock() {
-        writeln!(lf, "[THREAD {}] {} at sector {}: {}", thread_idx, category, sector, err).ok();
+        writeln!(lf, "{}", error_message).ok();
         lf.flush().ok();
     }
 }
 
-/// Log a simple message (both stderr and file)
+/// Log a simple message (both stderr and file) with timestamp
 fn log_simple<S: AsRef<str>>(log_file_arc: &Arc<Mutex<File>>, message: S) {
-    eprintln!("{}", message.as_ref());
+    let ts = current_timestamp();
+    let msg = format!("[{}] {}", ts, message.as_ref());
+    eprintln!("{}", msg);
     if let Ok(mut lf) = log_file_arc.lock() {
-        writeln!(lf, "{}", message.as_ref()).ok();
+        writeln!(lf, "{}", msg).ok();
         lf.flush().ok();
     }
 }
 
 /// Cross-platform method to retrieve free disk space in bytes
 #[cfg(target_family = "unix")]
-fn get_free_space(path: &std::path::Path) -> io::Result<u64> {
+fn get_free_space(path: &Path) -> io::Result<u64> {
     use std::ffi::CString;
     use std::mem;
     use std::os::raw::c_int;
@@ -180,7 +213,7 @@ fn get_free_space(path: &std::path::Path) -> io::Result<u64> {
 }
 
 #[cfg(target_family = "windows")]
-fn get_free_space(path: &std::path::Path) -> io::Result<u64> {
+fn get_free_space(path: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use winapi::shared::minwindef::BOOL;
     use winapi::um::fileapi::GetDiskFreeSpaceExW;
@@ -210,6 +243,24 @@ fn get_free_space(path: &std::path::Path) -> io::Result<u64> {
     Ok(unsafe { *(&free_bytes_available as *const _ as *const u64) })
 }
 
+/// Retrieve Host Information
+fn get_host_info() -> io::Result<String> {
+    let hostname = hostname::get()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .into_string()
+        .unwrap_or_else(|_| "Unknown".to_string());
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    Ok(format!("Host: {}, OS: {}, Architecture: {}", hostname, os, arch))
+}
+
+/// Retrieve Disk Information
+fn get_disk_info(path: &Path) -> io::Result<String> {
+    let free_space = get_free_space(path)?;
+    let (formatted_free, unit) = format_bytes(free_space);
+    Ok(format!("Disk Free Space: {:.2} {}", formatted_free, unit))
+}
+
 /// Single-Sector Read (--read-sector)
 fn single_sector_read(
     log_file_arc: &Arc<Mutex<File>>,
@@ -217,7 +268,7 @@ fn single_sector_read(
     sector: u64,
     block_size: usize,
 ) -> io::Result<()> {
-    log_simple(log_file_arc, format!("Single-Sector Read @ sector {}", sector));
+    log_simple(log_file_arc, format!("Initiating Single-Sector Read @ sector {}", sector));
 
     let mut file = OpenOptions::new().read(true).open(file_path)?;
     let offset = sector * block_size as u64;
@@ -226,19 +277,25 @@ fn single_sector_read(
     let mut buffer = vec![0u8; block_size];
 
     if let Err(e) = file.read_exact(&mut buffer) {
-        log_simple(log_file_arc, format!("Read Error @ sector {}: {}", sector, e));
+        // Do not terminate. Log the error and return it, but no "fatal" action is taken.
+        log_error(
+            log_file_arc,
+            0,
+            sector,
+            "Read Error",
+            &e,
+            None,
+            None,
+            Some(file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+        );
         return Err(e);
     }
 
-    // Hex dump of the entire block for verification/inspection
+    // Hex dump
     let hex_dump = buffer
         .chunks(16)
         .map(|chunk| {
-            chunk
-                .iter()
-                .map(|byte| format!("{:02X}", byte))
-                .collect::<Vec<String>>()
-                .join(" ")
+            chunk.iter().map(|byte| format!("{:02X}", byte)).collect::<Vec<String>>().join(" ")
         })
         .collect::<Vec<String>>()
         .join("\n");
@@ -246,7 +303,7 @@ fn single_sector_read(
     log_simple(
         log_file_arc,
         format!(
-            "Read {} bytes @ sector {}.\nHex Dump:\n{}",
+            "Successfully read {} bytes @ sector {}.\nHex Dump:\n{}",
             block_size, sector, hex_dump
         ),
     );
@@ -268,22 +325,31 @@ fn range_read(
     }
     log_simple(
         log_file_arc,
-        format!("Performing range read from sector {} to {}", start_sector, end_sector),
+        format!("Starting Range Read from sector {} to {}", start_sector, end_sector),
     );
 
     let mut file = OpenOptions::new().read(true).open(file_path)?;
     for sector in start_sector..end_sector {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
+            log_simple(log_file_arc, "Range read interrupted by user.");
             break;
         }
         let offset = sector * block_size as u64;
         file.seek(SeekFrom::Start(offset))?;
         let mut buffer = vec![0u8; block_size];
         if let Err(e) = file.read_exact(&mut buffer) {
-            log_simple(log_file_arc, format!("Read Error @ sector {}: {}", sector, e));
-            return Err(e);
+            log_error(
+                log_file_arc,
+                0,
+                sector,
+                "Read Error",
+                &e,
+                None,
+                None,
+                Some(file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+            );
+            continue; // Do not terminate the entire program
         }
-        // For large ranges, log only the first few bytes
         let preview_len = cmp::min(16, buffer.len());
         let preview = &buffer[..preview_len];
         log_simple(
@@ -295,6 +361,7 @@ fn range_read(
         );
     }
 
+    log_simple(log_file_arc, "Range read operation completed successfully.");
     Ok(())
 }
 
@@ -313,26 +380,35 @@ fn range_write(
     }
     log_simple(
         log_file_arc,
-        format!("Performing range write from sector {} to {}", start_sector, end_sector),
+        format!("Starting Range Write from sector {} to {}", start_sector, end_sector),
     );
 
     let mut file = OpenOptions::new().read(true).write(true).create(true).open(file_path)?;
     for sector in start_sector..end_sector {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
+            log_simple(log_file_arc, "Range write interrupted by user.");
             break;
         }
 
         let buffer = data_type.fill_block(block_size, sector);
         let offset = sector * block_size as u64;
 
-        // Single seek + write is more efficient than multiple small writes
-        file.seek(SeekFrom::Start(offset))?;
-        if let Err(e) = file.write_all(&buffer) {
-            log_simple(log_file_arc, format!("Write Error @ sector {}: {}", sector, e));
-            return Err(e);
+        if let Err(e) = file.seek(SeekFrom::Start(offset)).and_then(|_| file.write_all(&buffer)) {
+            log_error(
+                log_file_arc,
+                0,
+                sector,
+                "Write Error",
+                &e,
+                Some(&buffer),
+                None,
+                Some(file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+            );
+            continue; // Do not terminate the entire program
         }
     }
 
+    log_simple(log_file_arc, "Range write operation completed successfully.");
     Ok(())
 }
 
@@ -355,7 +431,7 @@ fn full_reliability_test(
     }
 
     // 1) Determine available space
-    let parent_dir = file_path.parent().unwrap_or(Path::new("."));
+    let parent_dir = file_path.parent().unwrap_or_else(|| Path::new("."));
     let free_space = get_free_space(parent_dir)?;
 
     // 2) Apply safety factor
@@ -369,15 +445,11 @@ fn full_reliability_test(
     let (ds, du) = format_bytes(total_bytes as u64);
     log_simple(
         log_file_arc,
-        format!("Full test size: {:.2} {}", ds, du),
+        format!("Total Test Size: {:.2} {}", ds, du),
     );
 
     // Pre-allocate test file for performance
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(file_path)?;
+    let f = OpenOptions::new().read(true).write(true).create(true).open(file_path)?;
     f.set_len(total_bytes as u64)?;
 
     // Compute total sectors
@@ -386,7 +458,7 @@ fn full_reliability_test(
 
     log_simple(
         log_file_arc,
-        format!("Full reliability test => total sectors: {}", total_sectors),
+        format!("Total Sectors for Test: {}", total_sectors),
     );
 
     // Time the concurrency test
@@ -403,10 +475,15 @@ fn full_reliability_test(
     // For concurrency, split the workload across threads
     let sectors_per_thread = total_sectors / num_threads;
     let remaining_sectors = total_sectors % num_threads;
-    let mut handles = Vec::with_capacity(num_threads);
 
     // Keep the data_type behind an Arc to avoid cloning large buffers per thread
     let data_type_arc = Arc::new(data_type);
+
+    // We'll store thread handles here
+    let mut handles = Vec::with_capacity(num_threads);
+
+    // Convert file_path to an owned PathBuf to avoid lifetimes escaping.
+    let file_path_owned = file_path.to_path_buf();
 
     for thread_idx in 0..num_threads {
         let log_clone = Arc::clone(log_file_arc);
@@ -415,33 +492,38 @@ fn full_reliability_test(
         let dt_clone = Arc::clone(&data_type_arc);
 
         // Each thread calculates its sector range
-        let start_sector = thread_idx * sectors_per_thread + cmp::min(thread_idx, remaining_sectors);
-        let mut end_sector_thread = start_sector + sectors_per_thread;
+        let start_sector_idx = thread_idx * sectors_per_thread + cmp::min(thread_idx, remaining_sectors);
+        let mut end_sector_thread = start_sector_idx + sectors_per_thread;
         if thread_idx < remaining_sectors {
             end_sector_thread += 1;
         }
 
-        // Convert to u64 for easier arithmetic below
-        let start_sector_u64 = start_sector as u64;
+        // Convert these to u64
+        let start_sector_u64 = start_sector_idx as u64;
         let end_sector_u64 = end_sector_thread as u64;
 
-        // Open separate file handle in each thread
-        let thread_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(file_path)
-            .expect("Failed to open file in thread");
+        // Clone the file_path for the thread
+        let file_path_thread = file_path_owned.clone();
 
         let handle = thread::spawn(move || {
-            let mut file_guard = thread_file;
+            // Each thread opens its own file handle
+            let thread_file = match OpenOptions::new().read(true).write(true).open(&file_path_thread) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Thread {}: Fatal error opening file: {}", thread_idx, e);
+                    HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
 
-            // Reuse large buffers for batched I/O
+            let mut file_guard = thread_file;
             let mut write_buf = vec![0u8; batch_size * block_size];
             let mut read_buf = vec![0u8; batch_size * block_size];
 
             let mut sector = start_sector_u64;
             while sector < end_sector_u64 {
                 if STOP_REQUESTED.load(Ordering::SeqCst) || HAS_FATAL_ERROR.load(Ordering::SeqCst) {
+                    // Gracefully end if there's a stop request or fatal error in some other thread.
                     break;
                 }
 
@@ -449,56 +531,86 @@ fn full_reliability_test(
                 let batch_end = cmp::min(sector + batch_size as u64, end_sector_u64);
                 let current_batch_size = (batch_end - sector) as usize;
 
-                // Fill the write buffer for these sectors
-				for i in 0..current_batch_size {
-					let offset_sector = sector + i as u64;
-					let block_data = dt_clone.fill_block(block_size, offset_sector);
-					write_buf[i * block_size..(i + 1) * block_size]
-						.copy_from_slice(&block_data);
-				}
-
+                // Fill the write buffer
+                for i in 0..current_batch_size {
+                    let offset_sector = sector + i as u64;
+                    let block_data = dt_clone.fill_block(block_size, offset_sector);
+                    write_buf[i * block_size..(i + 1) * block_size].copy_from_slice(&block_data);
+                }
 
                 let offset_bytes = sector * block_size as u64;
 
-                // Single seek for the entire batch write
+                // Single seek + batch write
                 if let Err(e) = file_guard
                     .seek(SeekFrom::Start(offset_bytes))
                     .and_then(|_| file_guard.write_all(&write_buf[..current_batch_size * block_size]))
                 {
-                    log_error(&log_clone, thread_idx, sector, "Write Error", &e);
+                    // Log error, increment counters, but do not kill the entire test
+                    log_error(
+                        &log_clone,
+                        thread_idx,
+                        sector,
+                        "Write Error",
+                        &e,
+                        Some(&write_buf[..current_batch_size * block_size]),
+                        None,
+                        Some(file_path_thread.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                    );
                     counters_clone.increment_write_errors();
-                    HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
-                    break;
+                    // Move on to the next batch
+                    sector += current_batch_size as u64;
+                    pb_clone.inc(current_batch_size as u64);
+                    continue;
                 }
 
-                // Single seek for the entire batch read
+                // Single seek + batch read
                 if let Err(e) = file_guard
                     .seek(SeekFrom::Start(offset_bytes))
                     .and_then(|_| file_guard.read_exact(&mut read_buf[..current_batch_size * block_size]))
                 {
-                    log_error(&log_clone, thread_idx, sector, "Read Error", &e);
+                    // Log error, increment counters, but do not kill the entire test
+                    log_error(
+                        &log_clone,
+                        thread_idx,
+                        sector,
+                        "Read Error",
+                        &e,
+                        None,
+                        Some(&read_buf[..current_batch_size * block_size]),
+                        Some(file_path_thread.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                    );
                     counters_clone.increment_read_errors();
-                    HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
-                    break;
+                    sector += current_batch_size as u64;
+                    pb_clone.inc(current_batch_size as u64);
+                    continue;
                 }
 
-                // Verify
+                // Verify contents
                 if &write_buf[..current_batch_size * block_size]
                     != &read_buf[..current_batch_size * block_size]
                 {
                     counters_clone.increment_mismatches();
-                    // Could log mismatches here if desired
+                    log_error(
+                        &log_clone,
+                        thread_idx,
+                        sector,
+                        "Data Mismatch",
+                        &io::Error::new(io::ErrorKind::Other, "Write vs. read mismatch"),
+                        Some(&write_buf[..current_batch_size * block_size]),
+                        Some(&read_buf[..current_batch_size * block_size]),
+                        Some(file_path_thread.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                    );
+                    // We DO NOT mark this as fatal or terminate.
                 }
 
                 // Update progress bar
                 pb_clone.inc(current_batch_size as u64);
-
                 sector += current_batch_size as u64;
-            }
+            } // end while
         });
 
         handles.push(handle);
-    }
+    } // end for
 
     // Join all threads
     for h in handles {
@@ -513,14 +625,14 @@ fn full_reliability_test(
     let duration = start_time.elapsed();
     log_simple(
         log_file_arc,
-        format!("Full reliability test completed in {duration:?}"),
+        format!("Full reliability test completed in {:.2?}", duration),
     );
 
-    // Return an error if any fatal I/O issues occurred
+    // Return an error if any truly fatal I/O issues occurred
     if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            "Fatal errors occurred during the test",
+            "A fatal error (e.g., file open failure) occurred.",
         ));
     }
 
@@ -550,7 +662,7 @@ fn main() -> io::Result<()> {
 
     let args: Vec<String> = env::args().collect();
 
-    // Single-Sector Read vs. Range Read vs. Range Write vs. Full test
+    // Parse command-line arguments
     let read_sector = get_arg_value(&args, "--read-sector").and_then(|v| v.parse::<u64>().ok());
     let range_read_start = get_arg_value(&args, "--range-read");
     let range_write_start = get_arg_value(&args, "--range-write");
@@ -563,7 +675,6 @@ fn main() -> io::Result<()> {
         .or_else(|| range_write_start.as_ref())
         .and_then(|v| v.parse::<u64>().ok());
 
-    // Attempt to parse end_sector for range ops
     let end_sector = start_sector.and_then(|_| {
         if let Some(pos) = args.iter().position(|x| x == "--range-read" || x == "--range-write") {
             args.get(pos + 2)?.parse::<u64>().ok()
@@ -582,9 +693,9 @@ fn main() -> io::Result<()> {
 
     let batch_size = get_arg_value(&args, "--batch-size")
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1); // Default to batch size of 1 if not specified
+        .unwrap_or(1);
 
-    // Derive the data type (hex, text, binary, or file)
+    // Determine data pattern
     let data_type = if let Some(ref dt) = data_type_str {
         match dt.as_str() {
             "hex" => DataType::Hex,
@@ -606,11 +717,10 @@ fn main() -> io::Result<()> {
             }
         }
     } else {
-        // Default pattern if none specified
         DataType::Binary
     };
 
-    // Prepare main file path
+    // Resolve main file path
     let path_str = get_arg_value(&args, "--path").unwrap_or_else(|| TEST_FILE_NAME.to_string());
     let path = Path::new(&path_str);
     let file_path = if path.is_dir() {
@@ -635,27 +745,65 @@ fn main() -> io::Result<()> {
         .create(true)
         .append(true)
         .write(true)
-        .open("disk_test.log")
-        .map_err(|e| {
-            eprintln!("Failed to open log file 'disk_test.log': {}", e);
-            e
-        })?;
+        .open("disk_test.log")?;
     let log_file_arc = Arc::new(Mutex::new(log_file));
+
+    // Retrieve and log host information
+    match get_host_info() {
+        Ok(info) => log_simple(&log_file_arc, format!("Host Information: {}", info)),
+        Err(e) => {
+            log_error(
+                &log_file_arc,
+                0,
+                0,
+                "Host Info Error",
+                &e,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+
+    // Log disk info for the correct directory (if file_path is a file, use its parent)
+    let disk_info_path = if file_path.is_dir() {
+        file_path.clone()
+    } else {
+        file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()
+    };
+
+    match get_disk_info(&disk_info_path) {
+        Ok(info) => log_simple(&log_file_arc, format!("Disk Information: {}", info)),
+        Err(e) => {
+            log_error(
+                &log_file_arc,
+                0,
+                0,
+                "Disk Info Error",
+                &e,
+                None,
+                None,
+                Some(disk_info_path.clone()),
+            );
+        }
+    }
+
+    // Log the start of the test
+    log_simple(&log_file_arc, "Starting Disk Reliability Test...");
 
     // 1) Single-Sector Read
     if let Some(sector) = read_sector {
         single_sector_read(&log_file_arc, &file_path, sector, block_size)?;
-        log_simple(&log_file_arc, "Single-sector read complete.");
+        log_simple(&log_file_arc, "Single-sector read operation completed successfully.");
         return Ok(());
     }
 
     // 2) Range Read
     if range_read_start.is_some() && data_type_str.is_none() {
-        // If user wants just a range read, they usually don't pass --data-type
         let s = start_sector.expect("Invalid start sector for range-read");
         let e = end_sector.expect("Invalid end sector for range-read");
         range_read(&log_file_arc, &file_path, s, e, block_size)?;
-        log_simple(&log_file_arc, "Range read complete.");
+        log_simple(&log_file_arc, "Range read operation completed successfully.");
         return Ok(());
     }
 
@@ -664,17 +812,14 @@ fn main() -> io::Result<()> {
         let s = start_sector.expect("Invalid start sector for range-write");
         let e = end_sector.expect("Invalid end sector for range-write");
         range_write(&log_file_arc, &file_path, s, e, block_size, &data_type)?;
-        log_simple(&log_file_arc, "Range write complete.");
+        log_simple(&log_file_arc, "Range write operation completed successfully.");
         return Ok(());
     }
 
     // 4) Full reliability test (default)
-    log_simple(
-        &log_file_arc,
-        "No single-sector or range mode selected. Running full reliability test...",
-    );
+    log_simple(&log_file_arc, "No single-sector or range mode selected. Initiating full reliability test...");
 
-    // Track errors across all threads
+    // Track errors
     let counters_arc = Arc::new(ErrorCounters::default());
 
     // Run the multi-threaded reliability test
@@ -689,20 +834,26 @@ fn main() -> io::Result<()> {
     )?;
 
     // Summarize final results
-    let c = counters_arc;
-    let total_errors = c.write_errors.load(Ordering::Relaxed)
-        + c.read_errors.load(Ordering::Relaxed)
-        + c.mismatches.load(Ordering::Relaxed);
+    let write_errs = counters_arc.write_errors.load(Ordering::Relaxed);
+    let read_errs = counters_arc.read_errors.load(Ordering::Relaxed);
+    let mismatches = counters_arc.mismatches.load(Ordering::Relaxed);
+    let total_errors = write_errs + read_errs + mismatches;
+
     log_simple(
         &log_file_arc,
         format!(
-            "Final Reliability Summary: Write Errors={}, Read Errors={}, Mismatches={}, Total={}",
-            c.write_errors.load(Ordering::Relaxed),
-            c.read_errors.load(Ordering::Relaxed),
-            c.mismatches.load(Ordering::Relaxed),
-            total_errors
+            "Final Reliability Summary:\n  Write Errors: {}\n  Read Errors: {}\n  Data Mismatches: {}\n  Total Errors: {}",
+            write_errs, read_errs, mismatches, total_errors
         ),
     );
 
+    // Optionally, add a final "success/failure" message
+    if total_errors == 0 {
+        log_simple(&log_file_arc, "All sectors verified successfully! No errors detected.");
+    } else {
+        log_simple(&log_file_arc, format!("Test completed with {} total errors. Review logs for details.", total_errors));
+    }
+
+    log_simple(&log_file_arc, "Disk Reliability Test completed.");
     Ok(())
 }
