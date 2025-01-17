@@ -2,7 +2,7 @@
 
 // Uncomment this if you'd like to keep using chrono for timestamps.
 // Make sure you add `chrono = "0.4"` to Cargo.toml.
-// use chrono::Local;
+use chrono::Local;
 
 use hostname;
 use std::cmp;
@@ -130,17 +130,12 @@ fn get_arg_value(args: &[String], key: &str) -> Option<String> {
     }
 }
 
-/// A simple helper to get a timestamp string without needing `chrono`.
+/// A helper to get a formatted timestamp using `chrono`.
 fn current_timestamp() -> String {
-    // If you prefer to omit timestamps entirely, just return an empty string here.
-    // Or, if using chrono, uncomment the line below:
-    // return Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-    // Minimal approach using system time since UNIX EPOCH:
-    let now = std::time::SystemTime::now();
-    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("T+{:.3}s", since_epoch.as_secs_f64())
+    // Format: YYYY-MM-DD HH:MM:SS
+    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
+
 
 /// Log an error (both stderr and file) with optional path.
 /// Data Mismatch, Read, Write errors will NOT terminate the test now; only log them.
