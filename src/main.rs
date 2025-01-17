@@ -145,7 +145,7 @@ impl DiskBenchmark for File {
 
 #[cfg(target_os = "windows")]
 impl DiskBenchmark for File {
-    fn create_for_benchmarking(path: &Path, _disable_cache: bool) -> Result<File> { // Renamed to _disable_cache
+    fn create_for_benchmarking(path: &Path, _disable_cache: bool) -> Result<File> {
         // For no-cache, you'd want FILE_FLAG_NO_BUFFERING via winapi, but let's keep it simple here
         let file = File::options()
             .create(true)
@@ -155,7 +155,7 @@ impl DiskBenchmark for File {
         Ok(file)
     }
 
-    fn open_for_benchmarking(path: &Path, _disable_cache: bool, write_access: bool) -> Result<File> { // Renamed to _disable_cache
+    fn open_for_benchmarking(path: &Path, _disable_cache: bool, write_access: bool) -> Result<File> {
         let file = if write_access {
             File::options().read(true).write(true).open(path)?
         } else {
@@ -405,7 +405,7 @@ fn single_sector_read(
     file_path: &Path,
     sector: u64,
     block_size: usize,
-) -> Result<()> { // Changed to anyhow::Result
+) -> Result<()> {
     log_simple(log_file_arc, format!("Initiating Single-Sector Read @ sector {}", sector));
 
     // For simplicity, regular open here. You could use DiskBenchmark if you prefer direct I/O.
@@ -423,9 +423,10 @@ fn single_sector_read(
             &e,
             None,
             None,
-            Some(file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+            // CHANGE 1: Use actual file path instead of parent()
+            Some(file_path.to_path_buf()),
         );
-        return Err(anyhow!(e)); // Convert io::Error to anyhow::Error
+        return Err(anyhow!(e));
     }
 
     let hex_dump = buffer
@@ -456,7 +457,7 @@ fn range_read(
     start_sector: u64,
     end_sector: u64,
     block_size: usize,
-) -> Result<()> { // Changed to anyhow::Result
+) -> Result<()> {
     if end_sector <= start_sector {
         eprintln!("Invalid range: end_sector <= start_sector.");
         std::process::exit(1);
@@ -485,7 +486,8 @@ fn range_read(
                 &e,
                 None,
                 None,
-                Some(file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                // CHANGE 2: Use actual path
+                Some(file_path.to_path_buf()),
             );
             continue;
         }
@@ -511,7 +513,7 @@ fn range_write(
     end_sector: u64,
     block_size: usize,
     data_type: &DataType,
-) -> Result<()> { // Changed to anyhow::Result
+) -> Result<()> {
     if end_sector <= start_sector {
         eprintln!("Invalid range: end_sector <= start_sector.");
         std::process::exit(1);
@@ -530,7 +532,10 @@ fn range_write(
         let buffer = data_type.fill_block(block_size, sector);
         let offset = sector * block_size as u64;
 
-        if let Err(e) = file.seek(SeekFrom::Start(offset)).and_then(|_| file.write_all(&buffer)) {
+        if let Err(e) = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(&buffer))
+        {
             log_error(
                 log_file_arc,
                 0,
@@ -539,9 +544,10 @@ fn range_write(
                 &e,
                 Some(&buffer),
                 None,
-                Some(file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                // CHANGE 3: Use actual path
+                Some(file_path.to_path_buf()),
             );
-            return Err(anyhow!(e)); // Convert io::Error to anyhow::Error
+            return Err(anyhow!(e));
         }
     }
 
@@ -550,8 +556,8 @@ fn range_write(
 }
 
 // --------------------------------- Mmap Helper (Optional) ----------------------------
-#[cfg(feature = "mmap")] // If you only want it behind a cargo feature, for instance
-fn mmap_file_for_test(file: &File, size: usize) -> Result<memmap2::MmapMut> { // Changed to anyhow::Result
+#[cfg(feature = "mmap")]
+fn mmap_file_for_test(file: &File, size: usize) -> Result<memmap2::MmapMut> {
     use memmap2::{MmapMut, MmapOptions};
     let mmap = unsafe { MmapOptions::new().len(size).map_mut(file)? };
     Ok(mmap)
@@ -569,9 +575,9 @@ fn full_reliability_test(
     no_write: bool,
     disable_cache: bool,
     use_mmap: bool,
-) -> Result<()> { // Changed to anyhow::Result
+) -> Result<()> {
     if block_size == 0 {
-        return Err(anyhow!("block_size cannot be zero")); // Changed to use `anyhow!` macro
+        return Err(anyhow!("block_size cannot be zero"));
     }
 
     // Determine free space & apply safety factor
@@ -589,6 +595,11 @@ fn full_reliability_test(
     // Create (or overwrite) the test file, possibly with direct I/O
     let file_for_create = File::create_for_benchmarking(file_path, disable_cache)?;
     file_for_create.set_len(total_bytes as u64)?;
+    // CHANGE 4: On Windows, force a flush so the OS truly reserves the space:
+    #[cfg(target_os = "windows")]
+    {
+        file_for_create.sync_all()?;
+    }
 
     // Calculate total sectors
     let total_sectors = total_bytes / block_size;
@@ -640,7 +651,6 @@ fn full_reliability_test(
                 }
             };
 
-            // If user wants to do mmapped I/O, we could do so. Example:
             #[cfg(feature = "mmap")]
             let maybe_mmap = if use_mmap && !no_write {
                 match mmap_file_for_test(&file_guard, (end_sector_u64 * block_size as u64) as usize) {
@@ -676,7 +686,7 @@ fn full_reliability_test(
 
                 let offset_bytes = sector * block_size as u64;
 
-                // If --no-write is set, we skip the actual write phase
+                // If --no-write is set, skip the actual write phase
                 if !no_write {
                     #[cfg(feature = "mmap")]
                     if let Some(mmap) = &maybe_mmap {
@@ -687,11 +697,22 @@ fn full_reliability_test(
                     }
                     #[cfg(not(feature = "mmap"))]
                     {
-                        // Regular write
+                        // Regular write, then flush on Windows
                         if let Err(e) = file_guard
                             .seek(SeekFrom::Start(offset_bytes))
                             .and_then(|_| {
                                 file_guard.write_all(&write_buf[..current_batch_size * block_size])
+                            })
+                            // CHANGE 5: Force flush after each write on Windows
+                            .and_then(|_| {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    file_guard.flush()
+                                }
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    Ok(())
+                                }
                             })
                         {
                             log_error(
@@ -702,7 +723,8 @@ fn full_reliability_test(
                                 &e,
                                 Some(&write_buf[..current_batch_size * block_size]),
                                 None,
-                                Some(path_clone.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                                // CHANGE 6: Use actual file path, not parent()
+                                Some(path_clone.clone()),
                             );
                             counters_clone.increment_write_errors();
                             sector += current_batch_size as u64;
@@ -720,7 +742,6 @@ fn full_reliability_test(
                         ..offset_bytes as usize + (current_batch_size * block_size)];
                     read_buf[..current_batch_size * block_size].copy_from_slice(mmap_slice);
                 } else {
-                    // standard read
                     if let Err(e) = file_guard
                         .seek(SeekFrom::Start(offset_bytes))
                         .and_then(|_| {
@@ -735,7 +756,8 @@ fn full_reliability_test(
                             &e,
                             None,
                             Some(&read_buf[..current_batch_size * block_size]),
-                            Some(path_clone.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                            // CHANGE 7: actual path
+                            Some(path_clone.clone()),
                         );
                         counters_clone.increment_read_errors();
                         sector += current_batch_size as u64;
@@ -744,8 +766,7 @@ fn full_reliability_test(
                     }
                 }
 
-                // Compare only if we wrote known data (i.e. not in --no-write mode).
-                // In no-write mode, we are verifying "whatever is there," which may or may not match our patterns.
+                // Compare only if we wrote known data
                 if !no_write {
                     if &write_buf[..current_batch_size * block_size]
                         != &read_buf[..current_batch_size * block_size]
@@ -759,7 +780,8 @@ fn full_reliability_test(
                             &io::Error::new(io::ErrorKind::Other, "Write vs. read mismatch"),
                             Some(&write_buf[..current_batch_size * block_size]),
                             Some(&read_buf[..current_batch_size * block_size]),
-                            Some(path_clone.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()),
+                            // CHANGE 8: actual path
+                            Some(path_clone.clone()),
                         );
                     }
                 }
@@ -816,7 +838,7 @@ fn format_bytes(bytes: u64) -> (f64, &'static str) {
 }
 
 // -------------------------------------- Main ---------------------------------------
-fn main() -> Result<()> { // Changed to anyhow::Result
+fn main() -> Result<()> {
     setup_signal_handler();
 
     let args: Vec<String> = env::args().collect();
@@ -902,7 +924,7 @@ fn main() -> Result<()> { // Changed to anyhow::Result
             if !parent.exists() {
                 fs::create_dir_all(parent).map_err(|e| {
                     eprintln!("Failed to create directory '{}': {}", parent.display(), e);
-                    anyhow!(e) // Changed to use `anyhow!` macro
+                    anyhow!(e)
                 })?;
             }
         }
@@ -931,7 +953,7 @@ fn main() -> Result<()> { // Changed to anyhow::Result
     let disk_info_path = if file_path.is_dir() {
         file_path.clone()
     } else {
-        file_path.parent().unwrap_or_else(|| Path::new(".")) .to_path_buf()
+        file_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
     };
     match get_disk_info(&disk_info_path) {
         Ok(info) => log_simple(&log_file_arc, format!("Disk Information: {}", info)),
