@@ -1,4 +1,3 @@
-//! src/main.rs
 #![allow(clippy::too_many_arguments)]
 
 // Standard library imports
@@ -44,7 +43,7 @@ use std::ptr;
 
 
 const TEST_FILE_NAME: &str = "disk_test_file.bin";
-const SAFETY_FACTOR: f64 = 0.10;
+const SAFETY_FACTOR: f64 = 0.10; // Used when test_size is not specified
 const DIRECT_IO_ALIGNMENT: usize = 4096;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -146,10 +145,16 @@ struct Cli {
 enum Commands {
     FullTest {
         #[clap(long)] path: Option<PathBuf>,
+        #[clap(long, value_parser = parse_size_with_suffix, help = "Specify total data size to test (e.g., 10G, 512M). If not set, uses a percentage of free disk space.")]
+        test_size: Option<u64>,
+        #[clap(long, default_value_t = 0, help = "Start test operations from this sector offset within the file.")]
+        resume_from_sector: u64,
         #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")] block_size: u64,
         #[clap(long, default_value_t = num_cpus::get())] threads: usize,
-        #[clap(long, value_parser = parse_size_with_suffix)] batch_kib: Option<u64>,
-        #[clap(long, default_value = "1")] batch_sectors: usize,
+        #[clap(long, value_parser = parse_size_with_suffix, group = "batch_config", help="Batch size in KiB. Overrides --batch-sectors if set.")]
+        batch_kib: Option<u64>,
+        #[clap(long, default_value = "1", group = "batch_config", help="Batch size in sectors. Used if --batch-kib is not set.")]
+        batch_sectors: usize,
         #[clap(long, value_enum, default_value = "binary")] data_type: DataTypeChoice,
         #[clap(long)] data_file: Option<PathBuf>,
         #[clap(long)] direct_io: bool,
@@ -159,6 +164,14 @@ enum Commands {
         #[clap(long)] path: PathBuf,
         #[clap(long)] sector: u64,
         #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")] block_size: u64,
+        #[clap(long)] direct_io: bool,
+    },
+    WriteSector {
+        #[clap(long)] path: PathBuf,
+        #[clap(long)] sector: u64,
+        #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")] block_size: u64,
+        #[clap(long, value_enum, default_value = "binary")] data_type: DataTypeChoice,
+        #[clap(long)] data_file: Option<PathBuf>,
         #[clap(long)] direct_io: bool,
     },
     RangeRead {
@@ -172,7 +185,17 @@ enum Commands {
     RangeWrite {
         #[clap(long)] path: PathBuf,
         #[clap(long)] start_sector: u64,
-        #[clap(long)] end_sector: u64,
+        #[clap(long)] end_sector: u64, // Exclusive
+        #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")] block_size: u64,
+        #[clap(long, value_enum, default_value = "binary")] data_type: DataTypeChoice,
+        #[clap(long)] data_file: Option<PathBuf>,
+        #[clap(long)] direct_io: bool,
+    },
+    VerifyRange {
+        #[clap(long)] path: PathBuf,
+        #[clap(long)] start_sector: u64,
+        #[clap(long, help = "End sector number (exclusive). If 0 or not provided, verifies to end of file.")]
+        end_sector: Option<u64>,
         #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")] block_size: u64,
         #[clap(long, value_enum, default_value = "binary")] data_type: DataTypeChoice,
         #[clap(long)] data_file: Option<PathBuf>,
@@ -222,7 +245,7 @@ fn log_error(
     log_f: &Option<Arc<Mutex<File>>>,
     pb: Option<&Arc<ProgressBar>>,
     thread_idx: usize,
-    sector: u64,
+    sector: u64, // This should be the absolute file sector
     category: &str,
     err_desc: &str,
     expected: Option<&[u8]>,
@@ -231,7 +254,7 @@ fn log_error(
 ) {
     let ts = current_timestamp();
     let mut error_message = format!(
-        "[{}] [THREAD {}] {} at sector {}: {}\n",
+        "[{}] [THREAD {}] {} at absolute file sector {}: {}\n", // Clarified sector meaning
         ts, thread_idx, category, sector, err_desc
     );
     if let Some(p) = path {
@@ -345,7 +368,6 @@ fn open_file_options(
 
 fn new_aligned_zeroed(len: usize, alignment: usize) -> AlignedVec<u8> {
     let mut v = AlignedVec::with_capacity(alignment, len);
-    // safe, works on every version
     for _ in 0..len {
         v.push(0);
     }
@@ -356,15 +378,13 @@ fn create_buffer(len: usize, alignment: usize, direct_io: bool) -> AlignedVec<u8
     if direct_io {
         new_aligned_zeroed(len, alignment)
     } else {
-        let mut v = AlignedVec::with_capacity(1, len);
+        let mut v = AlignedVec::with_capacity(1, len); // Standard alignment
         for _ in 0..len {
             v.push(0);
         }
         v
     }
 }
-
-
 
 fn single_sector_read(
     log_f: &Option<Arc<Mutex<File>>>,
@@ -376,6 +396,21 @@ fn single_sector_read(
     log_simple(log_f, None, format!("Initiating Single-Sector Read @ sector {}", sector));
     let mut file = open_file_options(file_path, true, false, false, direct_io, log_f).open(file_path)?;
     let offset = sector.saturating_mul(block_size as u64);
+
+    // Check if file is large enough before seeking & reading
+    let file_len = file.metadata()?.len();
+    if offset >= file_len {
+        let msg = format!("Error: Sector offset {} ({} bytes) is beyond end of file ({} bytes). Cannot read.", sector, offset, file_len);
+        log_simple(log_f, None, &msg);
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, msg));
+    }
+    if offset.saturating_add(block_size as u64) > file_len {
+         let msg = format!("Warning: Sector {} read ({} bytes) extends partially beyond EOF ({} bytes). Will attempt partial read if possible or error.", sector, block_size, file_len);
+         log_simple(log_f, None, &msg);
+         // read_exact will error if it can't fill the buffer. This is usually desired.
+    }
+
+
     file.seek(SeekFrom::Start(offset))?;
     let mut buffer = create_buffer(block_size, DIRECT_IO_ALIGNMENT, direct_io);
     if let Err(e) = file.read_exact(buffer.as_mut_slice()) {
@@ -386,6 +421,42 @@ fn single_sector_read(
     log_simple(log_f, None, format!("Successfully read {} bytes @ sector {}.\nHex Dump:\n{}", block_size, sector, hex_dump));
     Ok(())
 }
+
+fn single_sector_write(
+    log_f: &Option<Arc<Mutex<File>>>,
+    file_path: &Path,
+    sector: u64,
+    block_size: usize,
+    data_pattern: &DataTypePattern,
+    direct_io: bool,
+) -> io::Result<()> {
+    log_simple(log_f, None, format!("Initiating Single-Sector Write @ sector {}", sector));
+    let mut file = open_file_options(file_path, false, true, true, direct_io, log_f)
+        .open(file_path)?;
+
+    let offset = sector.saturating_mul(block_size as u64);
+    let required_len_for_write = offset.saturating_add(block_size as u64);
+
+    let current_len = file.metadata()?.len();
+    if current_len < required_len_for_write {
+        log_simple(log_f, None, format!("File current size {} bytes. Extending to {} bytes to accommodate write at sector {}.", current_len, required_len_for_write, sector));
+        file.set_len(required_len_for_write)?;
+    }
+    
+    file.seek(SeekFrom::Start(offset))?;
+    
+    let mut buffer_to_write = create_buffer(block_size, DIRECT_IO_ALIGNMENT, direct_io);
+    data_pattern.fill_block_inplace(buffer_to_write.as_mut_slice(), sector); // Use `sector` as the global offset for pattern generation
+
+    if let Err(e) = file.write_all(buffer_to_write.as_slice()) {
+        log_error(log_f, None, 0, sector, "Write Error", &e.to_string(), Some(buffer_to_write.as_slice()), None, Some(file_path.to_path_buf()));
+        return Err(e);
+    }
+    
+    log_simple(log_f, None, format!("Successfully wrote {} bytes with selected pattern @ sector {}.", block_size, sector));
+    Ok(())
+}
+
 
 fn range_read(
     log_f: &Option<Arc<Mutex<File>>>,
@@ -436,7 +507,7 @@ fn range_write(
     log_f: &Option<Arc<Mutex<File>>>,
     file_path: &Path,
     start_sector: u64,
-    end_sector: u64,
+    end_sector: u64, // Exclusive
     block_size: usize,
     data_pattern: &DataTypePattern,
     direct_io: bool,
@@ -446,40 +517,137 @@ fn range_write(
         log_simple(log_f, None, msg);
         return Err(io::Error::new(ErrorKind::InvalidInput, msg));
     }
-    log_simple(log_f, None, format!("Starting Range Write from sector {} to {}", start_sector, end_sector));
+    log_simple(log_f, None, format!("Starting Range Write from sector {} to {} (exclusive)", start_sector, end_sector));
     let mut file = open_file_options(file_path, true, true, true, direct_io, log_f).open(file_path)?;
+    
+    let required_len_for_write = end_sector.saturating_mul(block_size as u64);
+    let current_len = file.metadata()?.len();
+    if current_len < required_len_for_write {
+        log_simple(log_f, None, format!("File current size {} bytes. Extending to {} bytes to accommodate range write.", current_len, required_len_for_write));
+        file.set_len(required_len_for_write)?;
+    }
+
     let mut buffer_to_write = create_buffer(block_size, DIRECT_IO_ALIGNMENT, direct_io);
     for sector_idx in start_sector..end_sector {
         if STOP_REQUESTED.load(Ordering::SeqCst) { log_simple(log_f, None, "Range write interrupted by user."); break; }
-        data_pattern.fill_block_inplace(buffer_to_write.as_mut_slice(), sector_idx);
+        data_pattern.fill_block_inplace(buffer_to_write.as_mut_slice(), sector_idx); // Use absolute sector_idx for pattern
         let offset = sector_idx.saturating_mul(block_size as u64);
         if let Err(e) = file.seek(SeekFrom::Start(offset)).and_then(|_| file.write_all(buffer_to_write.as_slice())) {
             log_error(log_f, None, 0, sector_idx, "Write Error", &e.to_string(), Some(buffer_to_write.as_slice()), None, Some(file_path.to_path_buf()));
-            continue;
+            continue; // Optionally, could return Err(e) to stop on first error
         }
     }
     log_simple(log_f, None, "Range write operation completed.");
     Ok(())
 }
 
+fn range_verify(
+    log_f: &Option<Arc<Mutex<File>>>,
+    counters_arc: &Arc<ErrorCounters>,
+    file_path: &Path,
+    start_sector: u64,
+    end_sector_opt: Option<u64>,
+    block_size: usize,
+    data_pattern: &DataTypePattern,
+    direct_io: bool,
+) -> io::Result<()> {
+    let mut file = open_file_options(file_path, true, false, false, direct_io, log_f).open(file_path)?;
+    let file_len_bytes = file.metadata()?.len();
+    let file_len_sectors = if block_size > 0 { file_len_bytes / block_size as u64 } else { 0 };
+
+    let actual_end_sector = match end_sector_opt {
+        Some(0) | None => file_len_sectors,
+        Some(end) => {
+            if end <= start_sector {
+                let msg = "Invalid range for verification: end_sector must be greater than start_sector if specified and not 0.";
+                log_simple(log_f, None, msg);
+                return Err(io::Error::new(ErrorKind::InvalidInput, msg));
+            }
+            cmp::min(end, file_len_sectors)
+        }
+    };
+
+    if actual_end_sector <= start_sector {
+        if file_len_sectors == 0 && start_sector == 0 {
+            log_simple(log_f, None, "File is empty. Nothing to verify.");
+        } else {
+            log_simple(log_f, None, format!("Start sector {} is at or beyond end of specified/actual file range ({} sectors). Nothing to verify.", start_sector, actual_end_sector));
+        }
+        return Ok(());
+    }
+    
+    log_simple(log_f, None, format!("Starting Range Verify from sector {} to {} (exclusive)", start_sector, actual_end_sector));
+    
+    let total_sectors_to_verify = actual_end_sector.saturating_sub(start_sector);
+    if total_sectors_to_verify == 0 { // Should be caught by above, but defensive.
+        log_simple(log_f, None, "No sectors in range to verify.");
+        return Ok(());
+    }
+
+    let pb = ProgressBar::new(total_sectors_to_verify);
+    pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) Mismatches: {msg}").unwrap().progress_chars("##-"));
+    pb.set_message("0"); // Initial mismatches
+    let pb_arc = Arc::new(pb);
+
+    let mut read_buffer = create_buffer(block_size, DIRECT_IO_ALIGNMENT, direct_io);
+    let mut expected_buffer = create_buffer(block_size, DIRECT_IO_ALIGNMENT, false); // Pattern buffer, standard alignment ok
+
+    let mut local_mismatches = 0;
+
+    for sector_idx_offset in 0..total_sectors_to_verify {
+        if STOP_REQUESTED.load(Ordering::SeqCst) { log_simple(log_f, Some(&pb_arc), "Range verify interrupted by user."); break; }
+        
+        let current_sector_absolute = start_sector + sector_idx_offset;
+        let offset_bytes = current_sector_absolute.saturating_mul(block_size as u64);
+
+        if offset_bytes >= file_len_bytes { // Should not happen if actual_end_sector is derived from file_len_sectors
+            log_simple(log_f, Some(&pb_arc), format!("Attempted to read past EOF at sector {}. Stopping range verify.", current_sector_absolute));
+            break;
+        }
+        
+        if let Err(e) = file.seek(SeekFrom::Start(offset_bytes)) {
+            log_error(log_f, Some(&pb_arc), 0, current_sector_absolute, "Seek Error", &e.to_string(), None, None, Some(file_path.to_path_buf()));
+            counters_arc.increment_read_errors();
+            pb_arc.inc(1);
+            continue;
+        }
+        
+        if let Err(e) = file.read_exact(read_buffer.as_mut_slice()) {
+            log_error(log_f, Some(&pb_arc), 0, current_sector_absolute, "Read Error", &e.to_string(), None, None, Some(file_path.to_path_buf()));
+            counters_arc.increment_read_errors();
+            pb_arc.inc(1);
+            continue;
+        }
+
+        data_pattern.fill_block_inplace(expected_buffer.as_mut_slice(), current_sector_absolute);
+
+        if read_buffer.as_slice() != expected_buffer.as_slice() {
+            local_mismatches += 1;
+            counters_arc.increment_mismatches();
+            log_error(log_f, Some(&pb_arc), 0, current_sector_absolute, "Data Mismatch", "Block content mismatch during verification", Some(expected_buffer.as_slice()), Some(read_buffer.as_slice()), Some(file_path.to_path_buf()));
+            pb_arc.set_message(format!("{}", local_mismatches));
+        }
+        pb_arc.inc(1);
+    }
+    
+    if !pb_arc.is_finished() {
+        pb_arc.finish_with_message(format!("Completed. Mismatches: {}", local_mismatches));
+    }
+    log_simple(log_f, None, format!("Range verify operation completed. Total mismatches found: {}", local_mismatches));
+    if local_mismatches > 0 || counters_arc.read_errors.load(Ordering::Relaxed) > 0 {
+         return Err(io::Error::new(ErrorKind::InvalidData, format!("{} mismatches and {} read/seek errors found during verification.", local_mismatches, counters_arc.read_errors.load(Ordering::Relaxed))));
+    }
+    Ok(())
+}
+
+
 #[cfg(target_os = "windows")]
 fn preallocate_file_os(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    // winapi::shared::ntdef::LARGE_INTEGER is imported at the top.
-    // winapi::um::fileapi::FILE_ALLOCATION_INFO (struct) is imported at the top.
-    // winapi::um::minwinbase::FILE_INFO_BY_HANDLE_CLASS (enum type) is imported at the top.
-
     let mut allocation_size_li: LARGE_INTEGER = unsafe { mem::zeroed() };
-    unsafe {
-        *allocation_size_li.QuadPart_mut() = size as i64; // Cast u64 to i64
-    }
-
-    let info = FILE_ALLOCATION_INFO {
-        AllocationSize: allocation_size_li
-    };
-    
+    unsafe { *allocation_size_li.QuadPart_mut() = size as i64; }
+    let info = FILE_ALLOCATION_INFO { AllocationSize: allocation_size_li };
     let class_value: FILE_INFO_BY_HANDLE_CLASS = winapi::um::minwinbase::FileAllocationInfo;
-
     let ret = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle() as HANDLE,
@@ -488,14 +656,12 @@ fn preallocate_file_os(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>)
             mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
         )
     };
-
     if ret == 0 {
         let err = io::Error::last_os_error();
         log_simple(log_f, None, format!("SetFileInformationByHandle for pre-allocation failed: {}. Falling back to set_len.", err));
         file.set_len(size) // Fallback
     } else {
-        // Successfully set allocation size. Also ensure logical file size (EOF) is updated.
-        file.set_len(size)
+        file.set_len(size) // Also ensure logical file size (EOF) is updated.
     }
 }
 
@@ -528,6 +694,8 @@ fn full_reliability_test(
     file_path: &Path,
     log_f_opt: &Option<Arc<Mutex<File>>>,
     counters_arc: &Arc<ErrorCounters>,
+    user_specified_test_size: Option<u64>,
+    resume_from_sector: u64, // Absolute sector in file to start test operations
     block_size_u64: u64,
     num_threads: usize,
     data_pattern: DataTypePattern,
@@ -536,34 +704,93 @@ fn full_reliability_test(
     preallocate: bool,
 ) -> io::Result<()> {
     let block_size_usize = block_size_u64 as usize;
+    if block_size_u64 == 0 { // Should be caught earlier, but defensive
+        return Err(io::Error::new(ErrorKind::InvalidInput, "Block size cannot be zero."));
+    }
+
     let parent_dir_for_space = file_path.parent().map_or_else(|| Path::new("."), |p| if p.as_os_str().is_empty() { Path::new(".") } else { p });
-    let free_space = get_free_space(parent_dir_for_space)?;
-    let mut total_bytes_to_test = (free_space as f64 * (1.0 - SAFETY_FACTOR)) as u64;
-    total_bytes_to_test = (total_bytes_to_test / block_size_u64) * block_size_u64;
-    if total_bytes_to_test == 0 {
-        log_simple(log_f_opt, None, "Not enough free space for the test after applying safety factor and block alignment.");
-        return Err(io::Error::new(ErrorKind::OutOfMemory, "Not enough free space for test file."));
+    let free_space_on_volume = get_free_space(parent_dir_for_space)?;
+    
+    let start_offset_bytes_for_resume = resume_from_sector.saturating_mul(block_size_u64);
+
+    let (actual_bytes_to_test, required_total_file_size) = 
+        if let Some(requested_size_from_user) = user_specified_test_size {
+        let aligned_requested_data_size = (requested_size_from_user / block_size_u64) * block_size_u64;
+
+        if aligned_requested_data_size == 0 && requested_size_from_user > 0 {
+            log_simple(log_f_opt, None, format!("Warning: Requested test data size {} B is less than block size {} B. Effective data test size is 0 B.", requested_size_from_user, block_size_u64));
+        }
+        
+        let calculated_total_file_footprint = start_offset_bytes_for_resume.saturating_add(aligned_requested_data_size);
+
+        if calculated_total_file_footprint > free_space_on_volume {
+            let (fs_fmt, fs_unit) = format_bytes(free_space_on_volume);
+            let (req_fmt, req_unit) = format_bytes(calculated_total_file_footprint);
+            let msg = format!(
+                "Error: Test configuration requires {:.2} {} ({} B file size: {} B resume offset + {} B test data), but only {:.2} {} ({} B) is free on the volume.",
+                req_fmt, req_unit, calculated_total_file_footprint, start_offset_bytes_for_resume, aligned_requested_data_size,
+                fs_fmt, fs_unit, free_space_on_volume
+            );
+            log_simple(log_f_opt, None, &msg);
+            return Err(io::Error::new(ErrorKind::OutOfMemory, msg));
+        }
+        (aligned_requested_data_size, calculated_total_file_footprint)
+    } else { // Auto-calculate size based on free space
+        if start_offset_bytes_for_resume >= free_space_on_volume {
+            let (fs_fmt, fs_unit) = format_bytes(free_space_on_volume);
+            let (start_fmt, start_unit) = format_bytes(start_offset_bytes_for_resume);
+            let msg = format!("Error: Resume offset {:.2} {} ({} B at sector {}) is >= available free space {:.2} {} ({} B). Cannot test.", 
+                start_fmt, start_unit, start_offset_bytes_for_resume, resume_from_sector,
+                fs_fmt, fs_unit, free_space_on_volume);
+            log_simple(log_f_opt, None, &msg);
+            return Err(io::Error::new(ErrorKind::OutOfMemory, msg));
+        }
+        let space_available_for_data = free_space_on_volume - start_offset_bytes_for_resume;
+        let data_bytes_target_with_safety = (space_available_for_data as f64 * (1.0 - SAFETY_FACTOR)) as u64;
+        let aligned_data_bytes_auto = (data_bytes_target_with_safety / block_size_u64) * block_size_u64;
+        let calculated_total_file_footprint_auto = start_offset_bytes_for_resume.saturating_add(aligned_data_bytes_auto);
+        (aligned_data_bytes_auto, calculated_total_file_footprint_auto)
+    };
+    
+    let (ds_test, du_test) = format_bytes(actual_bytes_to_test);
+    let (ds_file, du_file) = format_bytes(required_total_file_size);
+
+    log_simple(log_f_opt, None, format!("Effective Test Data Size: {:.2} {} ({} bytes)", ds_test, du_test, actual_bytes_to_test));
+    if resume_from_sector > 0 {
+        log_simple(log_f_opt, None, format!("Test operations starting at sector: {} (file offset {} bytes)", resume_from_sector, start_offset_bytes_for_resume));
     }
-    let (ds, du) = format_bytes(total_bytes_to_test);
-    log_simple(log_f_opt, None, format!("Total Test Size: {:.2} {} ({} bytes)", ds, du, total_bytes_to_test));
+    log_simple(log_f_opt, None, format!("Required Total File Size for Test: {:.2} {} ({} bytes)", ds_file, du_file, required_total_file_size));
+
     let file_for_setup = open_file_options(file_path, true, true, true, false, log_f_opt).open(file_path)?;
-    if preallocate { preallocate_file(&file_for_setup, total_bytes_to_test, log_f_opt)?; } else { file_for_setup.set_len(total_bytes_to_test)?; }
-    drop(file_for_setup);
-    let total_sectors = total_bytes_to_test / block_size_u64;
-    if total_sectors == 0 && total_bytes_to_test > 0 {
-        log_simple(log_f_opt, None, "Calculated total sectors is 0, but test size is non-zero. Check block size alignment.");
-        return Err(io::Error::new(ErrorKind::InvalidInput, "Miscalculated total sectors."));
+    if preallocate { 
+        preallocate_file(&file_for_setup, required_total_file_size, log_f_opt)?; 
+    } else { 
+        // Ensure file is at least this large. set_len can also truncate.
+        file_for_setup.set_len(required_total_file_size)?; 
     }
-    log_simple(log_f_opt, None, format!("Total Sectors for Test: {}", total_sectors));
+    drop(file_for_setup);
+
+    let total_sectors_in_test_run = actual_bytes_to_test / block_size_u64;
+
+    if total_sectors_in_test_run == 0 {
+        log_simple(log_f_opt, None, "Total sectors to process in this run is 0. Test data phase will be skipped.");
+        if required_total_file_size > 0 {
+             log_simple(log_f_opt, None, format!("Note: Test file '{}' may have been created/resized to {} bytes due to resume_from_sector or preallocation settings.", file_path.display(), required_total_file_size));
+        }
+        return Ok(()); // No data to test, but setup might have occurred.
+    }
+    log_simple(log_f_opt, None, format!("Total Sectors in this Test Run: {}", total_sectors_in_test_run));
+    
     let start_time = Instant::now();
-    let pb = ProgressBar::new(total_sectors);
+    let pb = ProgressBar::new(total_sectors_in_test_run);
     pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) {wide_msg}").unwrap().progress_chars("##-"));
     let pb_arc = Arc::new(pb);
     let data_pattern_arc = Arc::new(data_pattern);
     let file_path_owned = file_path.to_path_buf();
     let mut handles = Vec::with_capacity(num_threads);
-    let sectors_per_thread_base = total_sectors / (num_threads as u64);
-    let remaining_sectors_total = total_sectors % (num_threads as u64);
+    
+    let sectors_per_thread_base = total_sectors_in_test_run / (num_threads as u64);
+    let remaining_sectors_for_distro = total_sectors_in_test_run % (num_threads as u64);
 
     for thread_idx in 0..num_threads {
         let log_clone = log_f_opt.clone();
@@ -571,68 +798,78 @@ fn full_reliability_test(
         let pb_clone_thread = Arc::clone(&pb_arc);
         let dt_clone = Arc::clone(&data_pattern_arc);
         let file_path_thread_clone = file_path_owned.clone();
-        let thread_start_sector = (thread_idx as u64 * sectors_per_thread_base) + cmp::min(thread_idx as u64, remaining_sectors_total);
-        let mut num_sectors_for_thread_u64 = sectors_per_thread_base;
-        if (thread_idx as u64) < remaining_sectors_total { num_sectors_for_thread_u64 += 1; }
-        if num_sectors_for_thread_u64 == 0 { continue; }
+        
+        let thread_start_sector_in_run = (thread_idx as u64 * sectors_per_thread_base) + cmp::min(thread_idx as u64, remaining_sectors_for_distro);
+        let mut num_sectors_for_this_thread = sectors_per_thread_base;
+        if (thread_idx as u64) < remaining_sectors_for_distro { num_sectors_for_this_thread += 1; }
+        
+        if num_sectors_for_this_thread == 0 { continue; } // No work for this thread
 
         let handle = thread::spawn(move || {
             let thread_file = match open_file_options(&file_path_thread_clone, true, true, false, direct_io, &log_clone).open(&file_path_thread_clone) {
                 Ok(f) => f,
                 Err(e) => {
                     let err_msg = format!("Thread {}: Fatal error opening file {}: {}", thread_idx, file_path_thread_clone.display(), e);
-                    pb_clone_thread.println(format!("[{}] {}", current_timestamp(), err_msg));
-                    log_simple(&log_clone, Some(&pb_clone_thread), &err_msg);
+                    pb_clone_thread.println(format!("[{}] {}", current_timestamp(), err_msg)); // Use pb.println for thread-safe console output
+                    log_simple(&log_clone, Some(&pb_clone_thread), &err_msg); // Also log to file
                     HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                     return;
                 }
             };
-            let mut file_guard = thread_file;
+            let mut file_guard = thread_file; // File handle now owned by this thread
             let batch_byte_capacity = batch_size_sectors * block_size_usize;
             let mut write_buf = create_buffer(batch_byte_capacity, DIRECT_IO_ALIGNMENT, direct_io);
             let mut read_buf  = create_buffer(batch_byte_capacity, DIRECT_IO_ALIGNMENT, direct_io);
-            let mut current_sector_offset_in_thread = 0u64;
+            
+            let mut current_sector_offset_within_thread_assignment = 0u64;
 
-            while current_sector_offset_in_thread < num_sectors_for_thread_u64 {
+            while current_sector_offset_within_thread_assignment < num_sectors_for_this_thread {
                 if STOP_REQUESTED.load(Ordering::SeqCst) || HAS_FATAL_ERROR.load(Ordering::SeqCst) { break; }
-                let remaining_in_thread = num_sectors_for_thread_u64 - current_sector_offset_in_thread;
-                let current_batch_actual_sectors = cmp::min(batch_size_sectors as u64, remaining_in_thread) as usize;
+                
+                let remaining_sectors_in_thread_assignment = num_sectors_for_this_thread - current_sector_offset_within_thread_assignment;
+                let current_batch_actual_sectors = cmp::min(batch_size_sectors as u64, remaining_sectors_in_thread_assignment) as usize;
                 let current_batch_byte_size = current_batch_actual_sectors * block_size_usize;
-                let first_sector_in_batch_global = thread_start_sector + current_sector_offset_in_thread;
+
+                // Calculate absolute file sector for the start of this batch
+                let first_sector_of_batch_in_run = thread_start_sector_in_run + current_sector_offset_within_thread_assignment;
+                let absolute_start_sector_of_batch = resume_from_sector + first_sector_of_batch_in_run;
 
                 for i in 0..current_batch_actual_sectors {
-                    let global_offset_sector_for_pattern = first_sector_in_batch_global + i as u64;
+                    let absolute_sector_for_pattern = absolute_start_sector_of_batch + i as u64;
                     let start_idx_in_buf = i * block_size_usize;
                     let end_idx_in_buf = start_idx_in_buf + block_size_usize;
-                    dt_clone.fill_block_inplace(&mut write_buf.as_mut_slice()[start_idx_in_buf..end_idx_in_buf], global_offset_sector_for_pattern);
+                    dt_clone.fill_block_inplace(&mut write_buf.as_mut_slice()[start_idx_in_buf..end_idx_in_buf], absolute_sector_for_pattern);
                 }
-                let offset_bytes_for_seek = first_sector_in_batch_global * block_size_u64;
+                
+                let offset_bytes_for_seek = absolute_start_sector_of_batch * block_size_u64;
+
                 if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes_for_seek)).and_then(|_| file_guard.write_all(&write_buf.as_slice()[..current_batch_byte_size])) {
-                    log_error(&log_clone, Some(&pb_clone_thread), thread_idx, first_sector_in_batch_global, "Write Error", &e.to_string(), Some(&write_buf.as_slice()[..current_batch_byte_size]), None, Some(file_path_thread_clone.clone()));
+                    log_error(&log_clone, Some(&pb_clone_thread), thread_idx, absolute_start_sector_of_batch, "Write Error", &e.to_string(), Some(&write_buf.as_slice()[..current_batch_byte_size]), None, Some(file_path_thread_clone.clone()));
                     counters_clone.increment_write_errors();
                 } else {
                     if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes_for_seek)).and_then(|_| file_guard.read_exact(&mut read_buf.as_mut_slice()[..current_batch_byte_size])) {
-                        log_error(&log_clone, Some(&pb_clone_thread), thread_idx, first_sector_in_batch_global, "Read Error", &e.to_string(), None, Some(&read_buf.as_slice()[..current_batch_byte_size]), Some(file_path_thread_clone.clone()));
+                        log_error(&log_clone, Some(&pb_clone_thread), thread_idx, absolute_start_sector_of_batch, "Read Error", &e.to_string(), None, Some(&read_buf.as_slice()[..current_batch_byte_size]), Some(file_path_thread_clone.clone()));
                         counters_clone.increment_read_errors();
                     } else {
                         let write_slice_for_cmp = &write_buf.as_slice()[..current_batch_byte_size];
                         let read_slice_for_cmp = &read_buf.as_slice()[..current_batch_byte_size];
                         if write_slice_for_cmp != read_slice_for_cmp {
                             counters_clone.increment_mismatches();
+                            // Find first mismatched block in batch for detailed logging
                             for i in 0..current_batch_actual_sectors {
                                 let block_start_idx_in_buf = i * block_size_usize;
                                 let block_end_idx_in_buf = block_start_idx_in_buf + block_size_usize;
                                 if write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf] != read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf] {
-                                    let mismatch_sector_global = first_sector_in_batch_global + i as u64;
-                                    log_error(&log_clone, Some(&pb_clone_thread), thread_idx, mismatch_sector_global, "Data Mismatch", "Block content mismatch", Some(&write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(&read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(file_path_thread_clone.clone()));
-                                    break;
+                                    let mismatch_absolute_file_sector = absolute_start_sector_of_batch + i as u64;
+                                    log_error(&log_clone, Some(&pb_clone_thread), thread_idx, mismatch_absolute_file_sector, "Data Mismatch", "Block content mismatch", Some(&write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(&read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(file_path_thread_clone.clone()));
+                                    break; // Log only the first mismatch in a batch for brevity
                                 }
                             }
                         }
                     }
                 }
                 pb_clone_thread.inc(current_batch_actual_sectors as u64);
-                current_sector_offset_in_thread += current_batch_actual_sectors as u64;
+                current_sector_offset_within_thread_assignment += current_batch_actual_sectors as u64;
             }
         });
         handles.push(handle);
@@ -646,8 +883,10 @@ fn full_reliability_test(
             HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
         }
     }
+
     if HAS_FATAL_ERROR.load(Ordering::SeqCst) && !pb_arc.is_finished() { pb_arc.abandon_with_message("Test aborted due to fatal error(s)."); }
     else if !pb_arc.is_finished() { pb_arc.finish_with_message("Test scan completed."); }
+    
     let duration = start_time.elapsed();
     log_simple(log_f_opt, None, format!("Full reliability test scan phase completed in {:.2?}.", duration));
     if HAS_FATAL_ERROR.load(Ordering::SeqCst) { return Err(io::Error::new(ErrorKind::Other, "Fatal error occurred in one or more threads. Check logs.")); }
@@ -668,11 +907,13 @@ fn format_bytes(bytes: u64) -> (f64, &'static str) {
 }
 
 fn resolve_file_path(cli_path: Option<PathBuf>, log_f: &Option<Arc<Mutex<File>>>) -> io::Result<PathBuf> {
-    let path_arg = cli_path.unwrap_or_else(|| PathBuf::from("."));
+    let path_arg = cli_path.unwrap_or_else(|| PathBuf::from(".")); // Default to current dir if no path provided
     let mut file_path_intermediate = if path_arg.is_dir() || path_arg.as_os_str() == "." || path_arg.as_os_str().is_empty() {
         let current_dir = env::current_dir()?;
-        current_dir.join(path_arg).join(TEST_FILE_NAME)
-    } else {
+        // If path_arg is "." or empty, join with current_dir. If path_arg is a specific dir, use it.
+        let base_dir = if path_arg.as_os_str() == "." || path_arg.as_os_str().is_empty() { current_dir } else { path_arg };
+        base_dir.join(TEST_FILE_NAME)
+    } else { // Assumed to be a file path or a path ending in what should be the file
         if let Some(parent) = path_arg.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 log_simple(log_f, None, format!("Creating parent directory: {}", parent.display()));
@@ -681,14 +922,26 @@ fn resolve_file_path(cli_path: Option<PathBuf>, log_f: &Option<Arc<Mutex<File>>>
         }
         if path_arg.is_absolute() { path_arg } else { env::current_dir()?.join(path_arg) }
     };
+
+    // Attempt to canonicalize. If it's NotFound, it means the file doesn't exist yet, which is fine.
+    // We still want an absolute path.
     match file_path_intermediate.canonicalize() {
-        Ok(canonical_path) => { log_simple(log_f, None, format!("Resolved and canonicalized test file path: {}", canonical_path.display())); Ok(canonical_path) }
+        Ok(canonical_path) => { 
+            log_simple(log_f, None, format!("Resolved and canonicalized test file path: {}", canonical_path.display())); 
+            Ok(canonical_path) 
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            if !file_path_intermediate.is_absolute() { file_path_intermediate = env::current_dir()?.join(file_path_intermediate); }
-            log_simple(log_f, None, format!("Resolved test file path (will be created): {}", file_path_intermediate.display()));
+            // If not absolute, make it absolute relative to current_dir.
+            if !file_path_intermediate.is_absolute() {
+                 file_path_intermediate = env::current_dir()?.join(file_path_intermediate);
+            }
+            log_simple(log_f, None, format!("Resolved test file path (will be created if needed): {}", file_path_intermediate.display()));
             Ok(file_path_intermediate)
         }
-        Err(e) => { log_simple(log_f, None, format!("Error resolving file path {}: {}", file_path_intermediate.display(), e)); Err(e) }
+        Err(e) => { 
+            log_simple(log_f, None, format!("Error resolving/canonicalizing file path '{}': {}", file_path_intermediate.display(), e)); 
+            Err(e) 
+        }
     }
 }
 
@@ -701,8 +954,8 @@ fn main() {
         };
     let main_result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| { main_logic(log_file_arc_opt.clone()) }));
     let exit_code = match main_result {
-        Ok(Ok(())) => { log_simple(&log_file_arc_opt, None, "Test completed successfully."); 0 }
-        Ok(Err(e)) => { log_simple(&log_file_arc_opt, None, format!("Test failed with an error: {}", e)); 1 }
+        Ok(Ok(())) => { log_simple(&log_file_arc_opt, None, "Operation completed successfully."); 0 }
+        Ok(Err(e)) => { log_simple(&log_file_arc_opt, None, format!("Operation failed with an error: {}", e)); 1 }
         Err(panic_payload) => {
             let mut panic_msg = format!("[{}] A critical error occurred: Test panicked!", current_timestamp());
             if let Some(s) = panic_payload.downcast_ref::<String>() { panic_msg.push_str(&format!("\nPanic message: {}", s)); }
@@ -723,54 +976,94 @@ fn main() {
 fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
     setup_signal_handler();
     let cli = Cli::parse();
-    log_simple(&log_file_arc_opt, None, "Starting Disk Stress Test...");
-    log_simple(&log_file_arc_opt, None, format!("CLI Command: {:?}", cli));
+    log_simple(&log_file_arc_opt, None, "Starting Disk Test Tool...");
+    log_simple(&log_file_arc_opt, None, format!("CLI Command: {:?}", cli)); // Log the parsed command
     if let Ok(info) = get_host_info() { log_simple(&log_file_arc_opt, None, format!("Host Information: {}", info)); }
     else { log_simple(&log_file_arc_opt, None, "Could not retrieve host information."); }
+    
     let initial_path_for_disk_info = match &cli.command {
         Commands::FullTest { path, .. } => path.as_ref().map_or_else(|| Path::new("."), |p| p.as_path()),
-        Commands::ReadSector { path, .. } | Commands::RangeRead { path, .. } | Commands::RangeWrite { path, .. } => path.as_path(),
+        Commands::ReadSector { path, .. } | 
+        Commands::WriteSector { path, .. } |
+        Commands::RangeRead { path, .. } | 
+        Commands::RangeWrite { path, .. } |
+        Commands::VerifyRange { path, .. } => path.as_path(),
     };
     if let Ok(info) = get_disk_info(initial_path_for_disk_info) { log_simple(&log_file_arc_opt, None, &info); }
     else { log_simple(&log_file_arc_opt, None, format!("Could not retrieve disk info for path: {}", initial_path_for_disk_info.display())); }
 
     match cli.command {
-        Commands::FullTest { path, block_size, threads, batch_kib, batch_sectors, data_type, data_file, direct_io, preallocate } => {
+        Commands::FullTest { path, test_size, resume_from_sector, block_size, threads, batch_kib, batch_sectors, data_type, data_file, direct_io, preallocate } => {
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 { log_simple(&log_file_arc_opt, None, "Block size 0 specified for FullTest, defaulting to 4096 bytes."); actual_block_size_u64 = 4096; }
-            if direct_io && actual_block_size_u64 % 512 != 0 { let msg = format!("ERROR: Direct I/O for FullTest, block size {} not multiple of 512.", actual_block_size_u64); log_simple(&log_file_arc_opt, None, &msg); return Err(io::Error::new(ErrorKind::InvalidInput, msg)); }
+            if direct_io && actual_block_size_u64 % 512 != 0 { let msg = format!("ERROR: Direct I/O requires block size (currently {}) to be a multiple of 512.", actual_block_size_u64); log_simple(&log_file_arc_opt, None, &msg); return Err(io::Error::new(ErrorKind::InvalidInput, msg)); }
+            
             log_simple(&log_file_arc_opt, None, format!("Effective block size: {} bytes", actual_block_size_u64));
             log_simple(&log_file_arc_opt, None, format!("Threads: {}", threads));
             log_simple(&log_file_arc_opt, None, format!("Direct I/O: {}", direct_io));
             log_simple(&log_file_arc_opt, None, format!("Preallocate: {}", preallocate));
+            
             let pattern = match data_type {
                 DataTypeChoice::Hex => DataTypePattern::Hex, DataTypeChoice::Text => DataTypePattern::Text, DataTypeChoice::Binary => DataTypePattern::Binary,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--data-file required for --data-type=file"))?;
-                    if let Ok(metadata) = fs::metadata(&df_path) { let file_len = metadata.len(); log_simple(&log_file_arc_opt, None, format!("Loading data pattern from file: {} (Size: {} bytes)", df_path.display(), file_len)); if file_len > 1024 * 1024 * 100 { log_simple(&log_file_arc_opt, None, format!("WARNING: Data file is large ({} bytes).", file_len)); } }
-                    else { log_simple(&log_file_arc_opt, None, format!("Loading data pattern from file: {} (metadata read failed)", df_path.display())); }
-                    DataTypePattern::File(fs::read(&df_path).map_err(|e| io::Error::new(e.kind(), format!("Failed to read data_file {}: {}", df_path.display(), e)))?)
+                    log_simple(&log_file_arc_opt, None, format!("Loading data pattern from file: {}", df_path.display()));
+                    let data_bytes = fs::read(&df_path).map_err(|e| io::Error::new(e.kind(), format!("Failed to read data_file {}: {}", df_path.display(), e)))?;
+                    if data_bytes.len() > 1024 * 1024 * 100 { log_simple(&log_file_arc_opt, None, format!("WARNING: Data file is large ({} bytes).", data_bytes.len())); }
+                    DataTypePattern::File(data_bytes)
                 }
             };
             log_simple(&log_file_arc_opt, None, format!("Data pattern: {:?}", data_type));
+
             let actual_batch_size_sectors_calc = if let Some(kib) = batch_kib { (kib.saturating_mul(1024)) / actual_block_size_u64 } else { batch_sectors as u64 };
-            let actual_batch_size_sectors = cmp::max(1, actual_batch_size_sectors_calc as usize);
+            let actual_batch_size_sectors = cmp::max(1, actual_batch_size_sectors_calc as usize); // Ensure at least 1 sector per batch
             log_simple(&log_file_arc_opt, None, format!("Effective batch size: {} sectors ({} bytes per batch)", actual_batch_size_sectors, actual_batch_size_sectors as u64 * actual_block_size_u64));
+            
             let counters_arc = Arc::new(ErrorCounters::new());
-            full_reliability_test(&file_path, &log_file_arc_opt, &counters_arc, actual_block_size_u64, threads, pattern, actual_batch_size_sectors, direct_io, preallocate)?;
-            let write_errs = counters_arc.write_errors.load(Ordering::Relaxed); let read_errs = counters_arc.read_errors.load(Ordering::Relaxed); let mismatches = counters_arc.mismatches.load(Ordering::Relaxed);
+            full_reliability_test(&file_path, &log_file_arc_opt, &counters_arc, test_size, resume_from_sector, actual_block_size_u64, threads, pattern, actual_batch_size_sectors, direct_io, preallocate)?;
+            
+            let write_errs = counters_arc.write_errors.load(Ordering::Relaxed); 
+            let read_errs = counters_arc.read_errors.load(Ordering::Relaxed); 
+            let mismatches = counters_arc.mismatches.load(Ordering::Relaxed);
             let total_errors = write_errs + read_errs + mismatches;
-            log_simple(&log_file_arc_opt, None, "--- Reliability Test Summary ---");
-            log_simple(&log_file_arc_opt, None, format!("  Write Errors: {}", write_errs)); log_simple(&log_file_arc_opt, None, format!("  Read Errors:  {}", read_errs)); log_simple(&log_file_arc_opt, None, format!("  Mismatches:   {}", mismatches)); log_simple(&log_file_arc_opt, None, format!("  Total Errors: {}", total_errors));
-            if total_errors == 0 && !HAS_FATAL_ERROR.load(Ordering::SeqCst) { log_simple(&log_file_arc_opt, None, "All checks passed. No errors detected."); }
-            else { log_simple(&log_file_arc_opt, None, format!("Test completed with {} non-fatal errors.", total_errors)); if HAS_FATAL_ERROR.load(Ordering::SeqCst) { log_simple(&log_file_arc_opt, None, "A fatal error was also encountered."); } return Err(io::Error::new(ErrorKind::Other, format!("Test finished with {} errors and/or fatal error.", total_errors))); }
+            
+            log_simple(&log_file_arc_opt, None, "--- Full Test Summary ---");
+            log_simple(&log_file_arc_opt, None, format!("  Write Errors: {}", write_errs)); 
+            log_simple(&log_file_arc_opt, None, format!("  Read Errors:  {}", read_errs)); 
+            log_simple(&log_file_arc_opt, None, format!("  Mismatches:   {}", mismatches)); 
+            log_simple(&log_file_arc_opt, None, format!("  Total Non-Fatal Errors Reported: {}", total_errors));
+            
+            if total_errors == 0 && !HAS_FATAL_ERROR.load(Ordering::SeqCst) { 
+                log_simple(&log_file_arc_opt, None, "All checks passed. No errors detected."); 
+            } else { 
+                let mut error_summary_msg = format!("Test completed with {} non-fatal errors.", total_errors);
+                if HAS_FATAL_ERROR.load(Ordering::SeqCst) { 
+                    error_summary_msg.push_str(" A fatal error was also encountered during the test.");
+                }
+                log_simple(&log_file_arc_opt, None, &error_summary_msg);
+                return Err(io::Error::new(ErrorKind::Other, error_summary_msg)); 
+            }
         }
         Commands::ReadSector { path, sector, block_size, direct_io } => {
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
             let mut actual_block_size_u64 = block_size; if actual_block_size_u64 == 0 { log_simple(&log_file_arc_opt, None, "Block size 0 for ReadSector, defaulting to 4096."); actual_block_size_u64 = 4096; }
             if direct_io && actual_block_size_u64 % 512 != 0 { let msg = format!("ERROR: Direct I/O for ReadSector, block size {} not multiple of 512.", actual_block_size_u64); log_simple(&log_file_arc_opt, None, &msg); return Err(io::Error::new(ErrorKind::InvalidInput, msg)); }
             single_sector_read(&log_file_arc_opt, &file_path, sector, actual_block_size_u64 as usize, direct_io)?;
+        }
+        Commands::WriteSector { path, sector, block_size, data_type, data_file, direct_io } => {
+            let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
+            let mut actual_block_size_u64 = block_size; if actual_block_size_u64 == 0 { log_simple(&log_file_arc_opt, None, "Block size 0 for WriteSector, defaulting to 4096."); actual_block_size_u64 = 4096; }
+            if direct_io && actual_block_size_u64 % 512 != 0 { let msg = format!("ERROR: Direct I/O for WriteSector, block size {} not multiple of 512.", actual_block_size_u64); log_simple(&log_file_arc_opt, None, &msg); return Err(io::Error::new(ErrorKind::InvalidInput, msg)); }
+            let pattern = match data_type {
+                DataTypeChoice::Hex => DataTypePattern::Hex, DataTypeChoice::Text => DataTypePattern::Text, DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::File => {
+                    let df_path = data_file.ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--data-file required for --data-type=file for WriteSector"))?;
+                     log_simple(&log_file_arc_opt, None, format!("WriteSector: Loading data pattern from file: {}", df_path.display()));
+                    DataTypePattern::File(fs::read(df_path)?)
+                }
+            };
+            single_sector_write(&log_file_arc_opt, &file_path, sector, actual_block_size_u64 as usize, &pattern, direct_io)?;
         }
         Commands::RangeRead { path, start_sector, end_sector, block_size, direct_io } => {
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
@@ -785,12 +1078,41 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let pattern = match data_type {
                 DataTypeChoice::Hex => DataTypePattern::Hex, DataTypeChoice::Text => DataTypePattern::Text, DataTypeChoice::Binary => DataTypePattern::Binary,
                 DataTypeChoice::File => {
-                    let df_path = data_file.ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--data-file required"))?;
-                    if let Ok(metadata) = fs::metadata(&df_path) { let file_len = metadata.len(); log_simple(&log_file_arc_opt, None, format!("RangeWrite: Loading data pattern file: {} (Size: {} bytes)", df_path.display(), file_len)); if file_len > 1024 * 1024 * 100 { log_simple(&log_file_arc_opt, None, format!("WARNING: Data file for RangeWrite is large ({} bytes).", file_len)); } }
+                    let df_path = data_file.ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--data-file required for --data-type=file for RangeWrite"))?;
+                    log_simple(&log_file_arc_opt, None, format!("RangeWrite: Loading data pattern from file: {}", df_path.display()));
                     DataTypePattern::File(fs::read(df_path)?)
                 }
             };
             range_write(&log_file_arc_opt, &file_path, start_sector, end_sector, actual_block_size_u64 as usize, &pattern, direct_io)?;
+        }
+        Commands::VerifyRange { path, start_sector, end_sector, block_size, data_type, data_file, direct_io } => {
+            let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
+            let mut actual_block_size_u64 = block_size; if actual_block_size_u64 == 0 { log_simple(&log_file_arc_opt, None, "Block size 0 for VerifyRange, defaulting to 4096."); actual_block_size_u64 = 4096; }
+            if direct_io && actual_block_size_u64 % 512 != 0 { let msg = format!("ERROR: Direct I/O for VerifyRange, block size {} not multiple of 512.", actual_block_size_u64); log_simple(&log_file_arc_opt, None, &msg); return Err(io::Error::new(ErrorKind::InvalidInput, msg)); }
+            let pattern = match data_type {
+                DataTypeChoice::Hex => DataTypePattern::Hex, DataTypeChoice::Text => DataTypePattern::Text, DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::File => {
+                    let df_path = data_file.ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--data-file required for --data-type=file for VerifyRange"))?;
+                     log_simple(&log_file_arc_opt, None, format!("VerifyRange: Loading data pattern from file: {}", df_path.display()));
+                    DataTypePattern::File(fs::read(df_path)?)
+                }
+            };
+            let counters_arc = Arc::new(ErrorCounters::new());
+            range_verify(&log_file_arc_opt, &counters_arc, &file_path, start_sector, end_sector, actual_block_size_u64 as usize, &pattern, direct_io)?;
+            
+            let mismatches = counters_arc.mismatches.load(Ordering::Relaxed);
+            let read_errors = counters_arc.read_errors.load(Ordering::Relaxed);
+            log_simple(&log_file_arc_opt, None, "--- Verify Range Summary ---");
+            log_simple(&log_file_arc_opt, None, format!("  Mismatches Found: {}", mismatches));
+            log_simple(&log_file_arc_opt, None, format!("  Read/Seek Errors Encountered: {}", read_errors));
+            if mismatches == 0 && read_errors == 0 {
+                 log_simple(&log_file_arc_opt, None, "Verification successful. No errors or mismatches detected in the specified range.");
+            } else {
+                let total_verify_issues = mismatches + read_errors;
+                let summary_msg = format!("Verification completed with {} issues ({} mismatches, {} read/seek errors).", total_verify_issues, mismatches, read_errors);
+                log_simple(&log_file_arc_opt, None, &summary_msg);
+                return Err(io::Error::new(ErrorKind::InvalidData, summary_msg));
+            }
         }
     }
     Ok(())

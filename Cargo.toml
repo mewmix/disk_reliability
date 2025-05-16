@@ -1,6 +1,6 @@
 [package]
 name = "disk_tester"
-version = "0.2.8" # Incremented
+version = "0.2.9" # Incremented
 edition = "2021"
 
 [dependencies]
