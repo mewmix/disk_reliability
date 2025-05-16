@@ -1,12 +1,22 @@
 [package]
 name = "disk_tester"
-version = "0.2.0"
+version = "0.2.8" # Incremented
 edition = "2021"
 
 [dependencies]
-winapi = { version = "0.3", features = ["fileapi", "winnt", "minwindef"] }
-indicatif = "0.17"   # For a progress bar
-libc = "0.2"
+chrono = "0.4.39"
+clap = { version = "4.5.4", features = ["derive"] }
 ctrlc = "3.4.5"
-hostname ="0.4.0"
-chrono ="0.4.39"
+indicatif = "0.17.8"
+parking_lot = "0.12.3"
+aligned-vec = { version = "0.5.0", default-features = false, features = ["std"] } # "std" IS CRITICAL
+libc = "0.2.155"
+num_cpus = "1.16.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = [
+    "fileapi",        # For SetFileInformationByHandle, FILE_INFO_BY_HANDLE_CLASS, GetDiskFreeSpaceExW
+    "minwinbase",   # For FILE_ALLOCATION_INFO struct definition
+    "winbase",      # For GetComputerNameW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH
+    "winnt",        # For HANDLE, ULARGE_INTEGER (definition), also where FileAllocationInfo enum member is defined for FILE_INFO_BY_HANDLE_CLASS
+]}
