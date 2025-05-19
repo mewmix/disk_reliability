@@ -159,6 +159,9 @@ enum Commands {
         #[clap(long)] data_file: Option<PathBuf>,
         #[clap(long)] direct_io: bool,
         #[clap(long)] preallocate: bool,
+        #[clap(long, default_value = "512",
+               help = "Chunk size in MiB for speed log lines (0 = disable)")]
+        log_chunk_mib: u64,
     },
     ReadSector {
         #[clap(long)] path: PathBuf,
@@ -702,6 +705,8 @@ fn full_reliability_test(
     batch_size_sectors: usize,
     direct_io: bool,
     preallocate: bool,
+    log_chunk_mib: u64,         // New parameter
+    data_type_name: String,     // New parameter for logging
 ) -> io::Result<()> {
     let block_size_usize = block_size_u64 as usize;
     if block_size_u64 == 0 { // Should be caught earlier, but defensive
@@ -792,6 +797,11 @@ fn full_reliability_test(
     let sectors_per_thread_base = total_sectors_in_test_run / (num_threads as u64);
     let remaining_sectors_for_distro = total_sectors_in_test_run % (num_threads as u64);
 
+    // Variables to be captured by threads
+    let log_chunk_mib_for_threads = log_chunk_mib;
+    let block_size_u64_for_threads = block_size_u64; // For chunk_start_offset calculation
+    let data_type_name_for_threads = data_type_name; // For logging
+
     for thread_idx in 0..num_threads {
         let log_clone = log_f_opt.clone();
         let counters_clone = Arc::clone(counters_arc);
@@ -799,6 +809,11 @@ fn full_reliability_test(
         let dt_clone = Arc::clone(&data_pattern_arc);
         let file_path_thread_clone = file_path_owned.clone();
         
+        // Captured values for this thread
+        let log_chunk_mib_captured = log_chunk_mib_for_threads;
+        let block_size_u64_captured = block_size_u64_for_threads;
+        let data_type_name_captured_clone = data_type_name_for_threads.clone(); // String needs clone for each thread
+
         let thread_start_sector_in_run = (thread_idx as u64 * sectors_per_thread_base) + cmp::min(thread_idx as u64, remaining_sectors_for_distro);
         let mut num_sectors_for_this_thread = sectors_per_thread_base;
         if (thread_idx as u64) < remaining_sectors_for_distro { num_sectors_for_this_thread += 1; }
@@ -810,17 +825,25 @@ fn full_reliability_test(
                 Ok(f) => f,
                 Err(e) => {
                     let err_msg = format!("Thread {}: Fatal error opening file {}: {}", thread_idx, file_path_thread_clone.display(), e);
-                    pb_clone_thread.println(format!("[{}] {}", current_timestamp(), err_msg)); // Use pb.println for thread-safe console output
-                    log_simple(&log_clone, Some(&pb_clone_thread), &err_msg); // Also log to file
+                    pb_clone_thread.println(format!("[{}] {}", current_timestamp(), err_msg)); 
+                    log_simple(&log_clone, Some(&pb_clone_thread), &err_msg); 
                     HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                     return;
                 }
             };
-            let mut file_guard = thread_file; // File handle now owned by this thread
+            let mut file_guard = thread_file; 
             let batch_byte_capacity = batch_size_sectors * block_size_usize;
             let mut write_buf = create_buffer(batch_byte_capacity, DIRECT_IO_ALIGNMENT, direct_io);
             let mut read_buf  = create_buffer(batch_byte_capacity, DIRECT_IO_ALIGNMENT, direct_io);
             
+            let chunk_bytes_target = log_chunk_mib_captured * 1_048_576; 
+            let mut chunk_bytes_accum: u64 = 0;
+            let mut chunk_time_accum: f64  = 0.0;
+            let mut chunk_min_mibps: f64   = f64::MAX;
+            let mut chunk_max_mibps: f64   = 0.0;
+            let mut chunk_start_offset: u64 = 0;   
+            let mut first_batch_in_chunk = true;
+
             let mut current_sector_offset_within_thread_assignment = 0u64;
 
             while current_sector_offset_within_thread_assignment < num_sectors_for_this_thread {
@@ -830,7 +853,6 @@ fn full_reliability_test(
                 let current_batch_actual_sectors = cmp::min(batch_size_sectors as u64, remaining_sectors_in_thread_assignment) as usize;
                 let current_batch_byte_size = current_batch_actual_sectors * block_size_usize;
 
-                // Calculate absolute file sector for the start of this batch
                 let first_sector_of_batch_in_run = thread_start_sector_in_run + current_sector_offset_within_thread_assignment;
                 let absolute_start_sector_of_batch = resume_from_sector + first_sector_of_batch_in_run;
 
@@ -841,33 +863,86 @@ fn full_reliability_test(
                     dt_clone.fill_block_inplace(&mut write_buf.as_mut_slice()[start_idx_in_buf..end_idx_in_buf], absolute_sector_for_pattern);
                 }
                 
-                let offset_bytes_for_seek = absolute_start_sector_of_batch * block_size_u64;
+                let offset_bytes_for_seek = absolute_start_sector_of_batch * block_size_u64_captured;
 
-                if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes_for_seek)).and_then(|_| file_guard.write_all(&write_buf.as_slice()[..current_batch_byte_size])) {
-                    log_error(&log_clone, Some(&pb_clone_thread), thread_idx, absolute_start_sector_of_batch, "Write Error", &e.to_string(), Some(&write_buf.as_slice()[..current_batch_byte_size]), None, Some(file_path_thread_clone.clone()));
-                    counters_clone.increment_write_errors();
-                } else {
-                    if let Err(e) = file_guard.seek(SeekFrom::Start(offset_bytes_for_seek)).and_then(|_| file_guard.read_exact(&mut read_buf.as_mut_slice()[..current_batch_byte_size])) {
-                        log_error(&log_clone, Some(&pb_clone_thread), thread_idx, absolute_start_sector_of_batch, "Read Error", &e.to_string(), None, Some(&read_buf.as_slice()[..current_batch_byte_size]), Some(file_path_thread_clone.clone()));
-                        counters_clone.increment_read_errors();
-                    } else {
+                let t0 = Instant::now();
+                let io_result = file_guard.seek(SeekFrom::Start(offset_bytes_for_seek))
+                    .and_then(|_| file_guard.write_all(&write_buf.as_slice()[..current_batch_byte_size]))
+                    .and_then(|_| file_guard.seek(SeekFrom::Start(offset_bytes_for_seek)))
+                    .and_then(|_| file_guard.read_exact(&mut read_buf.as_mut_slice()[..current_batch_byte_size]));
+                
+                let dt = t0.elapsed().as_secs_f64();
+                let batch_speed = mib_per_sec(current_batch_byte_size, dt);
+
+                match io_result {
+                    Ok(_) => { 
                         let write_slice_for_cmp = &write_buf.as_slice()[..current_batch_byte_size];
                         let read_slice_for_cmp = &read_buf.as_slice()[..current_batch_byte_size];
                         if write_slice_for_cmp != read_slice_for_cmp {
                             counters_clone.increment_mismatches();
-                            // Find first mismatched block in batch for detailed logging
-                            for i in 0..current_batch_actual_sectors {
+                            for i in 0..current_batch_actual_sectors { 
                                 let block_start_idx_in_buf = i * block_size_usize;
                                 let block_end_idx_in_buf = block_start_idx_in_buf + block_size_usize;
                                 if write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf] != read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf] {
                                     let mismatch_absolute_file_sector = absolute_start_sector_of_batch + i as u64;
                                     log_error(&log_clone, Some(&pb_clone_thread), thread_idx, mismatch_absolute_file_sector, "Data Mismatch", "Block content mismatch", Some(&write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(&read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(file_path_thread_clone.clone()));
-                                    break; // Log only the first mismatch in a batch for brevity
+                                    break; 
                                 }
                             }
                         }
                     }
+                    Err(e) => { 
+                        log_error(&log_clone, Some(&pb_clone_thread), thread_idx, absolute_start_sector_of_batch, "IO Error (Write/Read)", &e.to_string(), Some(&write_buf.as_slice()[..current_batch_byte_size]), Some(&read_buf.as_slice()[..current_batch_byte_size]), Some(file_path_thread_clone.clone()));
+                        counters_clone.increment_write_errors(); 
+                    }
                 }
+                
+                chunk_bytes_accum += current_batch_byte_size as u64;
+                chunk_time_accum  += dt;
+                // Apply the diff for min/max speed update
+                if batch_speed > 0.0 {
+                    chunk_min_mibps = chunk_min_mibps.min(batch_speed);
+                }
+                chunk_max_mibps = chunk_max_mibps.max(batch_speed);
+
+                if first_batch_in_chunk {
+                    chunk_start_offset = absolute_start_sector_of_batch * block_size_u64_captured;
+                    first_batch_in_chunk = false;
+                }
+
+                let reached_limit = chunk_bytes_target != 0 && chunk_bytes_accum >= chunk_bytes_target;
+                let last_batch = (current_sector_offset_within_thread_assignment + current_batch_actual_sectors as u64) >= num_sectors_for_this_thread;
+
+                if reached_limit || last_batch {
+                    if chunk_bytes_accum > 0 && chunk_time_accum > 0.0 && log_chunk_mib_captured != 0 {
+                        let avg_mibps = mib_per_sec(chunk_bytes_accum as usize, chunk_time_accum);
+                        log_simple(
+                            &log_clone,
+                            Some(&pb_clone_thread),
+                            format!(
+                                // Apply the diff for format string and arguments
+                                "{:>10} B: {:>4} MiB/{:<5} ({})  {:>5.0} MiB/s avg  {:>5.0} … {:>5.0}",
+                                chunk_start_offset,
+                                chunk_bytes_accum / 1_048_576,
+                                if block_size_usize < 1_048_576 {
+                                    format!("{} KiB", block_size_usize / 1024)
+                                } else {
+                                    format!("{} MiB", block_size_usize / 1_048_576)
+                                },
+                                data_type_name_captured_clone,
+                                avg_mibps,
+                                chunk_min_mibps.max(1.0), // Clamp min speed for display
+                                chunk_max_mibps
+                            )
+                        );
+                    }
+                    chunk_bytes_accum = 0;
+                    chunk_time_accum  = 0.0;
+                    chunk_min_mibps   = f64::MAX;
+                    chunk_max_mibps   = 0.0;
+                    first_batch_in_chunk = true;
+                }
+                
                 pb_clone_thread.inc(current_batch_actual_sectors as u64);
                 current_sector_offset_within_thread_assignment += current_batch_actual_sectors as u64;
             }
@@ -904,6 +979,10 @@ fn format_bytes(bytes: u64) -> (f64, &'static str) {
     else if bytes_f < GIB_F { (bytes_f / MIB_F, "MiB") }
     else if bytes_f < TIB_F { (bytes_f / GIB_F, "GiB") }
     else { (bytes_f / TIB_F, "TiB") }
+}
+
+fn mib_per_sec(bytes: usize, secs: f64) -> f64 {
+    if secs == 0.0 { 0.0 } else { bytes as f64 / secs / 1_048_576.0 }
 }
 
 fn resolve_file_path(cli_path: Option<PathBuf>, log_f: &Option<Arc<Mutex<File>>>) -> io::Result<PathBuf> {
@@ -993,7 +1072,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
     else { log_simple(&log_file_arc_opt, None, format!("Could not retrieve disk info for path: {}", initial_path_for_disk_info.display())); }
 
     match cli.command {
-        Commands::FullTest { path, test_size, resume_from_sector, block_size, threads, batch_kib, batch_sectors, data_type, data_file, direct_io, preallocate } => {
+        Commands::FullTest { path, test_size, resume_from_sector, block_size, threads, batch_kib, batch_sectors, data_type, data_file, direct_io, preallocate, log_chunk_mib } => {
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 { log_simple(&log_file_arc_opt, None, "Block size 0 specified for FullTest, defaulting to 4096 bytes."); actual_block_size_u64 = 4096; }
@@ -1003,7 +1082,10 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             log_simple(&log_file_arc_opt, None, format!("Threads: {}", threads));
             log_simple(&log_file_arc_opt, None, format!("Direct I/O: {}", direct_io));
             log_simple(&log_file_arc_opt, None, format!("Preallocate: {}", preallocate));
+            log_simple(&log_file_arc_opt, None, format!("Log Chunk Size: {} MiB (0 to disable)", log_chunk_mib));
             
+            let data_type_name = format!("{:?}", data_type).to_lowercase(); // For logging
+
             let pattern = match data_type {
                 DataTypeChoice::Hex => DataTypePattern::Hex, DataTypeChoice::Text => DataTypePattern::Text, DataTypeChoice::Binary => DataTypePattern::Binary,
                 DataTypeChoice::File => {
@@ -1014,14 +1096,19 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     DataTypePattern::File(data_bytes)
                 }
             };
-            log_simple(&log_file_arc_opt, None, format!("Data pattern: {:?}", data_type));
+            log_simple(&log_file_arc_opt, None, format!("Data pattern type: {:?}", data_type));
 
             let actual_batch_size_sectors_calc = if let Some(kib) = batch_kib { (kib.saturating_mul(1024)) / actual_block_size_u64 } else { batch_sectors as u64 };
             let actual_batch_size_sectors = cmp::max(1, actual_batch_size_sectors_calc as usize); // Ensure at least 1 sector per batch
             log_simple(&log_file_arc_opt, None, format!("Effective batch size: {} sectors ({} bytes per batch)", actual_batch_size_sectors, actual_batch_size_sectors as u64 * actual_block_size_u64));
             
             let counters_arc = Arc::new(ErrorCounters::new());
-            full_reliability_test(&file_path, &log_file_arc_opt, &counters_arc, test_size, resume_from_sector, actual_block_size_u64, threads, pattern, actual_batch_size_sectors, direct_io, preallocate)?;
+            full_reliability_test(
+                &file_path, &log_file_arc_opt, &counters_arc, 
+                test_size, resume_from_sector, actual_block_size_u64, threads, 
+                pattern, actual_batch_size_sectors, direct_io, preallocate,
+                log_chunk_mib, data_type_name
+            )?;
             
             let write_errs = counters_arc.write_errors.load(Ordering::Relaxed); 
             let read_errs = counters_arc.read_errors.load(Ordering::Relaxed); 
