@@ -248,7 +248,7 @@ fn log_error(
     log_f: &Option<Arc<Mutex<File>>>,
     pb: Option<&Arc<ProgressBar>>,
     thread_idx: usize,
-    sector: u64, // This should be the absolute file sector
+    sector: u64, 
     category: &str,
     err_desc: &str,
     expected: Option<&[u8]>,
@@ -263,15 +263,27 @@ fn log_error(
     if let Some(p) = path {
         error_message.push_str(&format!("File path context: {}\n", p.display()));
     }
-    if let (Some(exp), Some(act)) = (expected, actual) {
-        const MAX_DUMP_LEN: usize = 64;
+
+    const MAX_DUMP_LEN: usize = 64;
+
+    let expected_label = if category.contains("Mismatch") { "Expected" } else { "Intended Data" };
+
+    if let Some(exp) = expected {
         let exp_slice = &exp[..cmp::min(exp.len(), MAX_DUMP_LEN)];
-        let act_slice = &act[..cmp::min(act.len(), MAX_DUMP_LEN)];
         error_message.push_str(&format!(
-            "Expected (first {} bytes): {:02X?}\nActual   (first {} bytes): {:02X?}\n",
-            exp_slice.len(), exp_slice, act_slice.len(), act_slice
+            "{} (first {} bytes): {:02X?}\n",
+            expected_label, exp_slice.len(), exp_slice
         ));
     }
+
+    if let Some(act) = actual {
+        let act_slice = &act[..cmp::min(act.len(), MAX_DUMP_LEN)];
+        error_message.push_str(&format!(
+            "Actual   (first {} bytes): {:02X?}\n",
+            act_slice.len(), act_slice
+        ));
+    }
+
     log_message_internal(log_f, pb, error_message);
 }
 
