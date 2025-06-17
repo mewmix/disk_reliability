@@ -14,6 +14,8 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 use std::mem;
+use crossbeam_channel::{bounded, Receiver, Sender};
+
 
 // Crates
 use chrono::Local;
@@ -804,7 +806,6 @@ fn full_reliability_test(
     let pb_arc = Arc::new(pb);
     let data_pattern_arc = Arc::new(data_pattern);
     let file_path_owned = file_path.to_path_buf();
-    let mut handles = Vec::with_capacity(num_threads);
     
     let sectors_per_thread_base = total_sectors_in_test_run / (num_threads as u64);
     let remaining_sectors_for_distro = total_sectors_in_test_run % (num_threads as u64);
@@ -814,162 +815,176 @@ fn full_reliability_test(
     let block_size_u64_for_threads = block_size_u64; // For chunk_start_offset calculation
     let data_type_name_for_threads = data_type_name; // For logging
 
-    for thread_idx in 0..num_threads {
-        let log_clone = log_f_opt.clone();
-        let counters_clone = Arc::clone(counters_arc);
-        let pb_clone_thread = Arc::clone(&pb_arc);
-        let dt_clone = Arc::clone(&data_pattern_arc);
-        let file_path_thread_clone = file_path_owned.clone();
-        
-        // Captured values for this thread
-        let log_chunk_mib_captured = log_chunk_mib_for_threads;
-        let block_size_u64_captured = block_size_u64_for_threads;
-        let data_type_name_captured_clone = data_type_name_for_threads.clone(); // String needs clone for each thread
+    {
+    // ---------------------------------------------------------------
+    // 1. A single worker thread that handles the blocking system-calls
+    // ---------------------------------------------------------------
+    enum IoJob {
+        WriteReadVerify {
+            abs_start_sector: u64,      // absolute sector in the file
+            sector_count    : usize,    // how many sectors inside this batch
+            buf             : AlignedVec<u8>, // filled with the pattern
+        },
+        Terminate,
+    }
 
-        let thread_start_sector_in_run = (thread_idx as u64 * sectors_per_thread_base) + cmp::min(thread_idx as u64, remaining_sectors_for_distro);
-        let mut num_sectors_for_this_thread = sectors_per_thread_base;
-        if (thread_idx as u64) < remaining_sectors_for_distro { num_sectors_for_this_thread += 1; }
-        
-        if num_sectors_for_this_thread == 0 { continue; } // No work for this thread
+    struct IoResultMsg {
+        abs_start_sector: u64,
+        sector_count    : usize,
+        write_buf       : AlignedVec<u8>,
+        read_buf        : AlignedVec<u8>,
+        io_error        : Option<io::Error>, // None == success
+    }
 
-        let handle = thread::spawn(move || {
-            let thread_file = match open_file_options(&file_path_thread_clone, true, true, false, direct_io, &log_clone).open(&file_path_thread_clone) {
-                Ok(f) => f,
-                Err(e) => {
-                    let err_msg = format!("Thread {}: Fatal error opening file {}: {}", thread_idx, file_path_thread_clone.display(), e);
-                    pb_clone_thread.println(format!("[{}] {}", current_timestamp(), err_msg)); 
-                    log_simple(&log_clone, Some(&pb_clone_thread), &err_msg); 
-                    HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
-                    return;
-                }
-            };
-            let mut file_guard = thread_file; 
-            let batch_byte_capacity = batch_size_sectors * block_size_usize;
-            let mut write_buf = create_buffer(batch_byte_capacity, DIRECT_IO_ALIGNMENT, direct_io);
-            let mut read_buf  = create_buffer(batch_byte_capacity, DIRECT_IO_ALIGNMENT, direct_io);
-            
-            let chunk_bytes_target = log_chunk_mib_captured * 1_048_576; 
-            let mut chunk_bytes_accum: u64 = 0;
-            let mut chunk_time_accum: f64  = 0.0;
-            let mut chunk_min_mibps: f64   = f64::MAX;
-            let mut chunk_max_mibps: f64   = 0.0;
-            let mut chunk_start_offset: u64 = 0;   
-            let mut first_batch_in_chunk = true;
+    // two slots are enough for ping-pong
+    let (req_tx,  req_rx ): (Sender<IoJob>      , Receiver<IoJob>)       = bounded(2);
+    let (res_tx,  res_rx ): (Sender<IoResultMsg>, Receiver<IoResultMsg>) = bounded(2);
 
-            let mut current_sector_offset_within_thread_assignment = 0u64;
+    // Clone everything the worker needs.
+    let worker_file_path   = file_path_owned.clone();
+    let worker_log         = log_f_opt.clone();
+    let worker_pb_arc      = pb_arc.clone();
+    let worker_counters    = counters_arc.clone();
 
-            while current_sector_offset_within_thread_assignment < num_sectors_for_this_thread {
-                if STOP_REQUESTED.load(Ordering::SeqCst) || HAS_FATAL_ERROR.load(Ordering::SeqCst) { break; }
-                
-                let remaining_sectors_in_thread_assignment = num_sectors_for_this_thread - current_sector_offset_within_thread_assignment;
-                let current_batch_actual_sectors = cmp::min(batch_size_sectors as u64, remaining_sectors_in_thread_assignment) as usize;
-                let current_batch_byte_size = current_batch_actual_sectors * block_size_usize;
-
-                let first_sector_of_batch_in_run = thread_start_sector_in_run + current_sector_offset_within_thread_assignment;
-                let absolute_start_sector_of_batch = resume_from_sector + first_sector_of_batch_in_run;
-
-                for i in 0..current_batch_actual_sectors {
-                    let absolute_sector_for_pattern = absolute_start_sector_of_batch + i as u64;
-                    let start_idx_in_buf = i * block_size_usize;
-                    let end_idx_in_buf = start_idx_in_buf + block_size_usize;
-                    dt_clone.fill_block_inplace(&mut write_buf.as_mut_slice()[start_idx_in_buf..end_idx_in_buf], absolute_sector_for_pattern);
-                }
-                
-                let offset_bytes_for_seek = absolute_start_sector_of_batch * block_size_u64_captured;
-
-                let t0 = Instant::now();
-                let io_result = file_guard.seek(SeekFrom::Start(offset_bytes_for_seek))
-                    .and_then(|_| file_guard.write_all(&write_buf.as_slice()[..current_batch_byte_size]))
-                    .and_then(|_| file_guard.seek(SeekFrom::Start(offset_bytes_for_seek)))
-                    .and_then(|_| file_guard.read_exact(&mut read_buf.as_mut_slice()[..current_batch_byte_size]));
-                
-                let dt = t0.elapsed().as_secs_f64();
-                let batch_speed = mib_per_sec(current_batch_byte_size, dt);
-
-                match io_result {
-                    Ok(_) => { 
-                        let write_slice_for_cmp = &write_buf.as_slice()[..current_batch_byte_size];
-                        let read_slice_for_cmp = &read_buf.as_slice()[..current_batch_byte_size];
-                        if write_slice_for_cmp != read_slice_for_cmp {
-                            counters_clone.increment_mismatches();
-                            for i in 0..current_batch_actual_sectors { 
-                                let block_start_idx_in_buf = i * block_size_usize;
-                                let block_end_idx_in_buf = block_start_idx_in_buf + block_size_usize;
-                                if write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf] != read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf] {
-                                    let mismatch_absolute_file_sector = absolute_start_sector_of_batch + i as u64;
-                                    log_error(&log_clone, Some(&pb_clone_thread), thread_idx, mismatch_absolute_file_sector, "Data Mismatch", "Block content mismatch", Some(&write_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(&read_slice_for_cmp[block_start_idx_in_buf..block_end_idx_in_buf]), Some(file_path_thread_clone.clone()));
-                                    break; 
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => { 
-                        log_error(&log_clone, Some(&pb_clone_thread), thread_idx, absolute_start_sector_of_batch, "IO Error (Write/Read)", &e.to_string(), Some(&write_buf.as_slice()[..current_batch_byte_size]), Some(&read_buf.as_slice()[..current_batch_byte_size]), Some(file_path_thread_clone.clone()));
-                        counters_clone.increment_write_errors(); 
-                    }
-                }
-                
-                chunk_bytes_accum += current_batch_byte_size as u64;
-                chunk_time_accum  += dt;
-                // Apply the diff for min/max speed update
-                if batch_speed > 0.0 {
-                    chunk_min_mibps = chunk_min_mibps.min(batch_speed);
-                }
-                chunk_max_mibps = chunk_max_mibps.max(batch_speed);
-
-                if first_batch_in_chunk {
-                    chunk_start_offset = absolute_start_sector_of_batch * block_size_u64_captured;
-                    first_batch_in_chunk = false;
-                }
-
-                let reached_limit = chunk_bytes_target != 0 && chunk_bytes_accum >= chunk_bytes_target;
-                let last_batch = (current_sector_offset_within_thread_assignment + current_batch_actual_sectors as u64) >= num_sectors_for_this_thread;
-
-                if reached_limit || last_batch {
-                    if chunk_bytes_accum > 0 && chunk_time_accum > 0.0 && log_chunk_mib_captured != 0 {
-                        let avg_mibps = mib_per_sec(chunk_bytes_accum as usize, chunk_time_accum);
-                        log_simple(
-                            &log_clone,
-                            Some(&pb_clone_thread),
-                            format!(
-                                // Apply the diff for format string and arguments
-                                "{:>10} B: {:>4} MiB/{:<5} ({})  {:>5.0} MiB/s avg  {:>5.0} … {:>5.0}",
-                                chunk_start_offset,
-                                chunk_bytes_accum / 1_048_576,
-                                if block_size_usize < 1_048_576 {
-                                    format!("{} KiB", block_size_usize / 1024)
-                                } else {
-                                    format!("{} MiB", block_size_usize / 1_048_576)
-                                },
-                                data_type_name_captured_clone,
-                                avg_mibps,
-                                chunk_min_mibps.max(1.0), // Clamp min speed for display
-                                chunk_max_mibps
-                            )
-                        );
-                    }
-                    chunk_bytes_accum = 0;
-                    chunk_time_accum  = 0.0;
-                    chunk_min_mibps   = f64::MAX;
-                    chunk_max_mibps   = 0.0;
-                    first_batch_in_chunk = true;
-                }
-                
-                pb_clone_thread.inc(current_batch_actual_sectors as u64);
-                current_sector_offset_within_thread_assignment += current_batch_actual_sectors as u64;
+    let worker = thread::spawn(move || {
+        // Open once – sequential access, O_DIRECT optionally.
+        let mut f = match open_file_options(&worker_file_path, true, true, false,
+                                            direct_io, &worker_log)
+                        .open(&worker_file_path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log_simple(&worker_log, Some(&worker_pb_arc),
+                           format!("Worker thread cannot open test file: {e}"));
+                HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                return;
             }
-        });
-        handles.push(handle);
+        };
+
+        // Main worker loop
+        for job in req_rx.iter() {
+            match job {
+                IoJob::Terminate => break,
+                IoJob::WriteReadVerify {
+                    abs_start_sector,
+                    sector_count,
+                    mut buf,
+                } => {
+                    let byte_len  = sector_count * block_size_usize;
+                    let byte_offs = abs_start_sector * block_size_u64;
+
+                    // Allocate a read buffer of identical size / alignment
+                    let mut read_buf = create_buffer(byte_len, DIRECT_IO_ALIGNMENT, direct_io);
+
+                    let io_res = f.seek(SeekFrom::Start(byte_offs))
+                                  .and_then(|_| f.write_all(&buf[..byte_len]))
+                                  .and_then(|_| f.seek(SeekFrom::Start(byte_offs)))
+                                  .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
+
+                    // Ship the result (and both buffers!) back to the main thread
+                    let _ = res_tx.send(IoResultMsg {
+                        abs_start_sector,
+                        sector_count,
+                        write_buf: buf,
+                        read_buf,
+                        io_error: io_res.err(),
+                    });
+                }
+            }
+        }
+    });
+
+    // ---------------------------------------------------------------
+    // 2. The producing / verifying side – stays in the *main* thread
+    // ---------------------------------------------------------------
+    //
+    // Double buffers
+    let mut buf_a = create_buffer(batch_size_sectors * block_size_usize,
+                                  DIRECT_IO_ALIGNMENT, direct_io);
+    let mut buf_b = create_buffer(batch_size_sectors * block_size_usize,
+                                  DIRECT_IO_ALIGNMENT, direct_io);
+
+    // Helper to choose which buffer we fill next
+    let mut next_buf_is_a = true;
+
+    let mut global_sector_cursor = 0u64; // sector inside *this run* (0 … total_sectors_in_test_run-1)
+
+    while global_sector_cursor < total_sectors_in_test_run {
+        if STOP_REQUESTED.load(Ordering::SeqCst) ||
+           HAS_FATAL_ERROR.load(Ordering::SeqCst) { break; }
+
+        // -------------- 2.1  receive completed job (non-blocking) ----------
+        while let Ok(msg) = res_rx.try_recv() {
+            // a) Update counters & verify
+            if let Some(e) = msg.io_error {
+                counters_arc.increment_write_errors();
+                log_error(&log_f_opt, Some(&pb_arc), 0,
+                          msg.abs_start_sector, "IO Error", &e.to_string(),
+                          Some(&msg.write_buf[..]), Some(&msg.read_buf[..]),
+                          Some(file_path_owned.clone()));
+            } else if msg.write_buf[..msg.sector_count*block_size_usize] !=
+                      msg.read_buf [..msg.sector_count*block_size_usize] {
+                counters_arc.increment_mismatches();
+                log_error(&log_f_opt, Some(&pb_arc), 0,
+                          msg.abs_start_sector, "Data Mismatch",
+                          "write != read", None, None,
+                          Some(file_path_owned.clone()));
+            }
+
+            pb_arc.inc(msg.sector_count as u64); // progress
+        }
+
+        // -------------- 2.2  prepare the next batch ------------------------
+        let remaining = total_sectors_in_test_run - global_sector_cursor;
+        let this_batch_sectors =
+            cmp::min(batch_size_sectors as u64, remaining) as usize;
+
+        // choose & fill buffer
+        let target_buf = if next_buf_is_a { &mut buf_a } else { &mut buf_b };
+        next_buf_is_a = !next_buf_is_a; // flip for next round
+
+        let abs_first_sector = resume_from_sector + global_sector_cursor;
+        for i in 0..this_batch_sectors {
+            data_pattern_arc.fill_block_inplace(
+                &mut target_buf[i*block_size_usize .. (i+1)*block_size_usize],
+                abs_first_sector + i as u64);
+        }
+
+        // -------------- 2.3  send the job to the worker --------------------
+        req_tx.send(IoJob::WriteReadVerify {
+            abs_start_sector: abs_first_sector,
+            sector_count: this_batch_sectors,
+            buf: target_buf.clone(), // zero-copy because AlignedVec is Arc-internally ref-counted;
+                                     // if you prefer full move semantics use `std::mem::take`
+        }).expect("worker has stopped unexpectedly");
+
+        global_sector_cursor += this_batch_sectors as u64;
     }
 
-    for h in handles {
-        if let Err(e) = h.join() {
-            if !pb_arc.is_finished() { pb_arc.finish_and_clear(); }
-            let panic_msg = format!("A worker thread panicked: {:?}", e);
-            log_simple(log_f_opt, None, &panic_msg);
-            HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+    // Drain the remaining in-flight job (if any) ----------------------------
+    drop(req_tx);          // cause worker to exit after finishing jobs
+    for msg in res_rx.iter() {
+        // same verification logic as above
+        if let Some(e) = msg.io_error {
+            counters_arc.increment_write_errors();
+            log_error(&log_f_opt, Some(&pb_arc), 0,
+                      msg.abs_start_sector, "IO Error", &e.to_string(),
+                      Some(&msg.write_buf[..]), Some(&msg.read_buf[..]),
+                      Some(file_path_owned.clone()));
+        } else if msg.write_buf[..msg.sector_count*block_size_usize] !=
+                  msg.read_buf [..msg.sector_count*block_size_usize] {
+            counters_arc.increment_mismatches();
+            log_error(&log_f_opt, Some(&pb_arc), 0,
+                      msg.abs_start_sector, "Data Mismatch",
+                      "write != read", None, None,
+                      Some(file_path_owned.clone()));
         }
+        pb_arc.inc(msg.sector_count as u64);
     }
+
+    worker.join().expect("worker thread panicked");
+}
+//--------------------------------------------------------------------------//
+
 
     if HAS_FATAL_ERROR.load(Ordering::SeqCst) && !pb_arc.is_finished() { pb_arc.abandon_with_message("Test aborted due to fatal error(s)."); }
     else if !pb_arc.is_finished() { pb_arc.finish_with_message("Test scan completed."); }
