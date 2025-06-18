@@ -1526,7 +1526,9 @@ fn full_reliability_test(
                     0.0
                 };
                 let offset_bytes = msg.abs_start_sector * block_size_u64;
-                let (off_val, off_unit) = format_bytes_int(offset_bytes);
+                let end_offset_bytes = offset_bytes + batch_bytes;
+                let (off_start_val, off_start_unit) = format_bytes_int(offset_bytes);
+                let (off_end_val, off_end_unit) = format_bytes_int(end_offset_bytes);
                 let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
                 let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
                 let pattern_label = match &*data_pattern_arc {
@@ -1539,7 +1541,7 @@ fn full_reliability_test(
                     &log_f_opt,
                     Some(&pb_arc),
                     format!(
-                        "{off_val} {off_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
+                        "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
                         pattern_label,
                         write_mib,
                         read_mib,
