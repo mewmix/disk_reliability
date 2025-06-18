@@ -29,6 +29,7 @@ Run the tool with the following customizable options:
 - `--start-sector <sector>`: Starting sector for testing. Default: `0`.
 - `--end-sector <sector>`: Ending sector for testing. If omitted, tests until free space is exhausted.
 - `--random`: Use random data patterns instead of sequential patterns.
+- `--passes <number>`: Run the full disk test multiple times. Maximum of 3 passes.
 
 ### Example Commands
 1. Basic Test:
