@@ -1748,8 +1748,13 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             } else {
                 log_simple(&log_file_arc_opt, None, "USB controller information unavailable.");
             }
-            if let Ok(serials) = hardware_info::get_usb_serial_numbers() {
-                log_simple(&log_file_arc_opt, None, serials);
+            match hardware_info::get_usb_serial_numbers() {
+                Ok(serials) => log_simple(&log_file_arc_opt, None, serials),
+                Err(_) => log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    "No USB disk serial numbers found.",
+                ),
             }
         }
         #[cfg(target_os = "linux")]
@@ -1759,8 +1764,13 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             } else {
                 log_simple(&log_file_arc_opt, None, "USB controller information unavailable.");
             }
-            if let Ok(serials) = hardware_info::get_usb_serial_numbers() {
-                log_simple(&log_file_arc_opt, None, serials);
+            match hardware_info::get_usb_serial_numbers() {
+                Ok(serials) => log_simple(&log_file_arc_opt, None, serials),
+                Err(_) => log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    "No USB disk serial numbers found.",
+                ),
             }
         }
     }
