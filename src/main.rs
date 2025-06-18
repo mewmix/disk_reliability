@@ -1252,6 +1252,25 @@ fn full_reliability_test(
     let (ds_test, du_test) = format_bytes_int(actual_bytes_to_test);
     let (ds_file, du_file) = format_bytes_int(required_total_file_size);
 
+    let (file_val, file_unit) = format_bytes_float(required_total_file_size);
+    let (portion_val, portion_unit) =
+        format_bytes_float(batch_size_sectors as u64 * block_size_u64);
+    let (buf_val, buf_unit) = format_bytes_float(block_size_u64);
+    log_simple(
+        log_f_opt,
+        None,
+        format!(
+            "Using test file of {:.2} {} ({} bytes), write/read/verify {:.2} {} portions at a time using a {:.0} {} memory buffer",
+            file_val,
+            file_unit,
+            required_total_file_size,
+            portion_val,
+            portion_unit,
+            buf_val,
+            buf_unit
+        ),
+    );
+
     log_simple(log_f_opt, None, format!("Effective Test Data Size: {} {} ({} bytes)", ds_test, du_test, actual_bytes_to_test));
     if resume_from_sector > 0 {
         log_simple(log_f_opt, None, format!("Test operations starting at sector: {} (file offset {} bytes)", resume_from_sector, start_offset_bytes_for_resume));
@@ -1310,6 +1329,8 @@ fn full_reliability_test(
             sector_count: u32,
             diff: Option<u32>, // offset-in-block if mismatch, else None
             io_error: Option<io::Error>,
+            write_secs: f64,
+            read_secs: f64,
             buf: AlignedVec<u8>, // The buffer is returned for reuse
         }
 
@@ -1363,11 +1384,30 @@ fn full_reliability_test(
                         let byte_len = sector_count * block_size_usize;
                         let byte_offs = abs_start_sector * block_size_u64;
 
-                        let io_res = f
-                            .seek(SeekFrom::Start(byte_offs))
-                            .and_then(|_| f.write_all(&buf[..byte_len]))
-                            .and_then(|_| f.seek(SeekFrom::Start(byte_offs)))
-                            .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
+                        let mut write_secs = 0.0f64;
+                        let mut read_secs = 0.0f64;
+
+                        let seek_res = f.seek(SeekFrom::Start(byte_offs));
+                        let io_res = if let Err(e) = seek_res {
+                            Err(e)
+                        } else {
+                            let w_start = Instant::now();
+                            let w_res = f.write_all(&buf[..byte_len]);
+                            write_secs = w_start.elapsed().as_secs_f64();
+                            if w_res.is_err() {
+                                w_res
+                            } else {
+                                let seek_res2 = f.seek(SeekFrom::Start(byte_offs));
+                                if let Err(e) = seek_res2 {
+                                    Err(e)
+                                } else {
+                                    let r_start = Instant::now();
+                                    let r_res = f.read_exact(&mut read_buf[..byte_len]);
+                                    read_secs = r_start.elapsed().as_secs_f64();
+                                    r_res
+                                }
+                            }
+                        };
 
                         let mut diff = None;
                         if io_res.is_ok() {
@@ -1388,6 +1428,8 @@ fn full_reliability_test(
                             sector_count: sector_count as u32,
                             diff,
                             io_error: io_res.err(),
+                            write_secs,
+                            read_secs,
                             buf, // return the buffer for reuse
                         });
                     }
@@ -1472,6 +1514,38 @@ fn full_reliability_test(
                 jobs_in_flight -= 1;
                 pb_arc.inc(msg.sector_count as u64);
 
+                let batch_bytes = msg.sector_count as u64 * block_size_u64;
+                let write_mib = if msg.write_secs > 0.0 {
+                    (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs
+                } else {
+                    0.0
+                };
+                let read_mib = if msg.read_secs > 0.0 {
+                    (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs
+                } else {
+                    0.0
+                };
+                let offset_bytes = msg.abs_start_sector * block_size_u64;
+                let (off_val, off_unit) = format_bytes_int(offset_bytes);
+                let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
+                let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
+                let pattern_label = match &*data_pattern_arc {
+                    DataTypePattern::Hex => "hex",
+                    DataTypePattern::Text => "text",
+                    DataTypePattern::Binary => "binary",
+                    DataTypePattern::File(_) => "file",
+                };
+                log_simple(
+                    &log_f_opt,
+                    Some(&pb_arc),
+                    format!(
+                        "{off_val} {off_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
+                        pattern_label,
+                        write_mib,
+                        read_mib,
+                    ),
+                );
+
                 if let Some(e) = msg.io_error {
                     counters_arc.increment_write_errors();
                     counters_arc.increment_read_errors(); // An IO error can be write or read
@@ -1551,6 +1625,26 @@ const fn format_bytes_int(bytes: u64) -> (u64, &'static str) {
         b if b < GIB => (b / MIB, "MiB"),
         b if b < TIB => (b / GIB, "GiB"),
         b => (b / TIB, "TiB"),
+    }
+}
+
+fn format_bytes_float(bytes: u64) -> (f64, &'static str) {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+
+    let b = bytes as f64;
+    if b < KIB {
+        (b, "Bytes")
+    } else if b < MIB {
+        (b / KIB, "KiB")
+    } else if b < GIB {
+        (b / MIB, "MiB")
+    } else if b < TIB {
+        (b / GIB, "GiB")
+    } else {
+        (b / TIB, "TiB")
     }
 }
 
@@ -1887,6 +1981,11 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                         format!("Starting pass {} of {}", pass_idx + 1, passes),
                     );
                 }
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    format!("Begin iteration {}", pass_idx + 1),
+                );
 
                 STOP_REQUESTED.store(false, Ordering::SeqCst);
                 HAS_FATAL_ERROR.store(false, Ordering::SeqCst);
