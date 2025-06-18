@@ -1,21 +1,18 @@
-use sysinfo::{Disk, System};
-use sysinfo::traits::{DiskExt, SystemExt};
-use sysinfo::RefreshKind;
+use sysinfo::Disks;
 use std::io;
 use std::process::Command;
 use std::collections::HashMap;
 
 /// Retrieves information about the disk at the given path.
 pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
-    let refresh_kind = RefreshKind::new().with_disks();
-    let mut sys = System::new_with_specifics(refresh_kind);
-
-    for disk in sys.disks() {
-        let mount_point = disk.mount_point().to_string_lossy();
-        if mount_point.starts_with(disk_path) {
+    let mut disks = Disks::new_with_refreshed_list();
+    for disk in disks.list() {
+        let mount_point_cow = disk.mount_point().to_string_lossy();
+        let mount_point_str = mount_point_cow.as_ref();
+        if disk_path.starts_with(mount_point_str) || mount_point_str.starts_with(disk_path) {
             return Ok(format!(
                 "Disk: {}\nType: {:?}\nTotal Space: {:.2} GB\nAvailable: {:.2} GB",
-                mount_point,
+                mount_point_str,
                 disk.kind(),
                 disk.total_space() as f64 / (1024.0 * 1024.0 * 1024.0),
                 disk.available_space() as f64 / (1024.0 * 1024.0 * 1024.0)
