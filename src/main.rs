@@ -622,6 +622,61 @@ fn single_sector_read(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Read;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_parse_size_with_suffix() {
+        assert_eq!(parse_size_with_suffix("1K").unwrap(), 1024);
+        assert_eq!(parse_size_with_suffix("1KB").unwrap(), 1024);
+        assert_eq!(parse_size_with_suffix("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_with_suffix("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert!(parse_size_with_suffix("abc").is_err());
+    }
+
+    #[test]
+    fn test_format_bytes_int() {
+        assert_eq!(format_bytes_int(512), (512, "Bytes"));
+        assert_eq!(format_bytes_int(1536), (1, "KiB"));
+        assert_eq!(format_bytes_int(3 * 1024 * 1024), (3, "MiB"));
+        assert_eq!(format_bytes_int(5 * 1024 * 1024 * 1024), (5, "GiB"));
+    }
+
+    #[test]
+    fn test_data_pattern_fill_block() {
+        let mut buf = vec![0u8; 16];
+        DataTypePattern::Hex.fill_block_inplace(&mut buf, 0);
+        assert_eq!(&buf, b"0123456789ABCDEF");
+
+        DataTypePattern::Binary.fill_block_inplace(&mut buf, 1);
+        let expected: Vec<u8> = (1u8..=16).collect();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_single_sector_write_and_read() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let log: Option<Arc<Mutex<File>>> = None;
+
+        let pattern = DataTypePattern::Binary;
+        single_sector_write(&log, path, 0, 16, &pattern, false).unwrap();
+
+        let mut file = File::open(path).unwrap();
+        let mut buf = vec![0u8; 16];
+        file.read_exact(&mut buf).unwrap();
+        let mut expected = vec![0u8; 16];
+        pattern.fill_block_inplace(&mut expected, 0);
+        assert_eq!(buf, expected);
+
+        single_sector_read(&log, path, 0, 16, false).unwrap();
+    }
+}
+
 fn single_sector_write(
     log_f: &Option<Arc<Mutex<File>>>,
     file_path: &Path,
