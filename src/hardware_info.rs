@@ -133,12 +133,37 @@ pub fn get_usb_controller_info_linux(disk_path: &str) -> io::Result<String> {
 pub fn get_usb_serial_numbers() -> io::Result<String> {
     let context = Context::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut info = String::new();
-    let devices = context.devices().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let devices = context
+        .devices()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     for device in devices.iter() {
         if let Ok(desc) = device.device_descriptor() {
+            // Filter for USB mass storage devices (class code 0x08). Some devices
+            // report class code 0 and specify it in the interface descriptor.
+            let mut is_mass_storage = desc.class_code() == 0x08;
+            if !is_mass_storage {
+                if let Ok(config) = device.active_config_descriptor() {
+                    for interface in config.interfaces() {
+                        for interface_desc in interface.descriptors() {
+                            if interface_desc.class_code() == 0x08 {
+                                is_mass_storage = true;
+                                break;
+                            }
+                        }
+                        if is_mass_storage {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !is_mass_storage {
+                continue;
+            }
+
             let handle_result: Result<DeviceHandle<Context>, _> = device.open();
-            if let Ok(mut handle) = handle_result {
+            if let Ok(handle) = handle_result {
                 let language = handle
                     .read_languages(Duration::from_secs(1))
                     .ok()
@@ -153,21 +178,23 @@ pub fn get_usb_serial_numbers() -> io::Result<String> {
                     let serial = handle
                         .read_serial_number_string(lang, &desc, Duration::from_secs(1))
                         .unwrap_or_default();
-                    info.push_str(&format!(
-                        "Bus {:03} Device {:03}: {} {} - Serial: {}\n",
-                        device.bus_number(),
-                        device.address(),
-                        manufacturer,
-                        product,
-                        serial
-                    ));
+
+                    if !serial.is_empty() {
+                        info.push_str(&format!(
+                            "USB Disk: {} {} - Serial: {}\n",
+                            manufacturer, product, serial
+                        ));
+                    }
                 }
             }
         }
     }
 
     if info.is_empty() {
-        Err(io::Error::new(io::ErrorKind::NotFound, "No USB devices found"))
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No USB disk serial numbers found",
+        ))
     } else {
         Ok(info)
     }
