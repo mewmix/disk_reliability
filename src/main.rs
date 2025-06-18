@@ -91,7 +91,7 @@ enum DataTypeChoice {
     File,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum DataTypePattern {
     Hex,
     Text,
@@ -216,6 +216,8 @@ enum Commands {
         direct_io: bool,
         #[clap(long)]
         preallocate: bool,
+        #[clap(long, default_value_t = 1, help = "Number of passes for the full test (max 3).")]
+        passes: usize,
     },
     ReadSector {
         #[clap(long)]
@@ -1788,6 +1790,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             #[cfg(feature = "direct")]
             direct_io,
             preallocate,
+            passes,
         } => {
             #[cfg(feature = "direct")]
             let use_direct_io = direct_io;
@@ -1870,42 +1873,61 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 ),
             );
 
-            let counters_arc = Arc::new(ErrorCounters::new());
-            full_reliability_test(
-                &file_path,
-                &log_file_arc_opt,
-                &counters_arc,
-                test_size,
-                resume_from_sector,
-                actual_block_size_u64,
-                threads,
-                pattern,
-                actual_batch_size_sectors,
-                use_direct_io,
-                preallocate,
-                cli.verbose,
-            )?;
+            if passes == 0 || passes > 3 {
+                let msg = format!("passes must be between 1 and 3 (got {})", passes);
+                log_simple(&log_file_arc_opt, None, &msg);
+                return Err(io::Error::new(ErrorKind::InvalidInput, msg));
+            }
 
-            let write_errs = counters_arc.write_errors.load(Ordering::Relaxed);
-            let read_errs = counters_arc.read_errors.load(Ordering::Relaxed);
-            let mismatches = counters_arc.mismatches.load(Ordering::Relaxed);
-            let total_errors = write_errs + read_errs + mismatches;
-
-            log_simple(&log_file_arc_opt, None, "--- Full Test Summary ---");
-            log_simple(&log_file_arc_opt, None, format!("  Write/Read Errors: {}", write_errs + read_errs));
-            log_simple(&log_file_arc_opt, None, format!("  Mismatches:   {}", mismatches));
-            log_simple(&log_file_arc_opt, None, format!("  Total Non-Fatal Errors Reported: {}", total_errors));
-
-            if total_errors == 0 && !HAS_FATAL_ERROR.load(Ordering::SeqCst) {
-                log_simple(&log_file_arc_opt, None, "All checks passed. No errors detected.");
-            } else {
-                let mut error_summary_msg =
-                    format!("Test completed with {} non-fatal errors.", total_errors);
-                if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
-                    error_summary_msg.push_str(" A fatal error was also encountered during the test.");
+            for pass_idx in 0..passes {
+                if passes > 1 {
+                    log_simple(
+                        &log_file_arc_opt,
+                        None,
+                        format!("Starting pass {} of {}", pass_idx + 1, passes),
+                    );
                 }
-                log_simple(&log_file_arc_opt, None, &error_summary_msg);
-                return Err(io::Error::new(ErrorKind::Other, error_summary_msg));
+
+                STOP_REQUESTED.store(false, Ordering::SeqCst);
+                HAS_FATAL_ERROR.store(false, Ordering::SeqCst);
+
+                let counters_arc = Arc::new(ErrorCounters::new());
+                full_reliability_test(
+                    &file_path,
+                    &log_file_arc_opt,
+                    &counters_arc,
+                    test_size,
+                    resume_from_sector,
+                    actual_block_size_u64,
+                    threads,
+                    pattern.clone(),
+                    actual_batch_size_sectors,
+                    use_direct_io,
+                    preallocate,
+                    cli.verbose,
+                )?;
+
+                let write_errs = counters_arc.write_errors.load(Ordering::Relaxed);
+                let read_errs = counters_arc.read_errors.load(Ordering::Relaxed);
+                let mismatches = counters_arc.mismatches.load(Ordering::Relaxed);
+                let total_errors = write_errs + read_errs + mismatches;
+
+                log_simple(&log_file_arc_opt, None, "--- Full Test Summary ---");
+                log_simple(&log_file_arc_opt, None, format!("  Write/Read Errors: {}", write_errs + read_errs));
+                log_simple(&log_file_arc_opt, None, format!("  Mismatches:   {}", mismatches));
+                log_simple(&log_file_arc_opt, None, format!("  Total Non-Fatal Errors Reported: {}", total_errors));
+
+                if total_errors == 0 && !HAS_FATAL_ERROR.load(Ordering::SeqCst) {
+                    log_simple(&log_file_arc_opt, None, "All checks passed. No errors detected.");
+                } else {
+                    let mut error_summary_msg =
+                        format!("Test completed with {} non-fatal errors.", total_errors);
+                    if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
+                        error_summary_msg.push_str(" A fatal error was also encountered during the test.");
+                    }
+                    log_simple(&log_file_arc_opt, None, &error_summary_msg);
+                    return Err(io::Error::new(ErrorKind::Other, error_summary_msg));
+                }
             }
         }
         Commands::ReadSector {
