@@ -21,3 +21,6 @@ winapi = { version = "0.3.9", features = [
     "winbase",      # For GetComputerNameW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH
     "winnt",        # For HANDLE, ULARGE_INTEGER (definition), also where FileAllocationInfo enum member is defined for FILE_INFO_BY_HANDLE_CLASS
 ]}
+
+[features]
+direct = []
