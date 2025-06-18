@@ -1,21 +1,21 @@
-use sysinfo::{Disk, System};
-use sysinfo::traits::{DiskExt, SystemExt};
-use sysinfo::RefreshKind;
+use sysinfo::Disks;
 use std::io;
 use std::process::Command;
 use std::collections::HashMap;
+use std::time::Duration;
+
+use rusb::{Context, DeviceHandle, UsbContext};
 
 /// Retrieves information about the disk at the given path.
 pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
-    let refresh_kind = RefreshKind::new().with_disks();
-    let mut sys = System::new_with_specifics(refresh_kind);
-
-    for disk in sys.disks() {
-        let mount_point = disk.mount_point().to_string_lossy();
-        if mount_point.starts_with(disk_path) {
+    let mut disks = Disks::new_with_refreshed_list();
+    for disk in disks.list() {
+        let mount_point_cow = disk.mount_point().to_string_lossy();
+        let mount_point_str = mount_point_cow.as_ref();
+        if disk_path.starts_with(mount_point_str) || mount_point_str.starts_with(disk_path) {
             return Ok(format!(
                 "Disk: {}\nType: {:?}\nTotal Space: {:.2} GB\nAvailable: {:.2} GB",
-                mount_point,
+                mount_point_str,
                 disk.kind(),
                 disk.total_space() as f64 / (1024.0 * 1024.0 * 1024.0),
                 disk.available_space() as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -127,4 +127,99 @@ pub fn get_usb_controller_info_linux(disk_path: &str) -> io::Result<String> {
     }
 
     Ok(format!("USB Controller Info: {}", matched_device))
+}
+
+/// Lists connected USB devices and attempts to read their serial numbers using libusb.
+pub fn get_usb_serial_numbers() -> io::Result<String> {
+    let context = Context::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut info = String::new();
+    let devices = context.devices().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    for device in devices.iter() {
+        if let Ok(desc) = device.device_descriptor() {
+            let handle_result: Result<DeviceHandle<Context>, _> = device.open();
+            if let Ok(mut handle) = handle_result {
+                let language = handle
+                    .read_languages(Duration::from_secs(1))
+                    .ok()
+                    .and_then(|l| l.into_iter().next());
+                if let Some(lang) = language {
+                    let manufacturer = handle
+                        .read_manufacturer_string(lang, &desc, Duration::from_secs(1))
+                        .unwrap_or_default();
+                    let product = handle
+                        .read_product_string(lang, &desc, Duration::from_secs(1))
+                        .unwrap_or_default();
+                    let serial = handle
+                        .read_serial_number_string(lang, &desc, Duration::from_secs(1))
+                        .unwrap_or_default();
+                    info.push_str(&format!(
+                        "Bus {:03} Device {:03}: {} {} - Serial: {}\n",
+                        device.bus_number(),
+                        device.address(),
+                        manufacturer,
+                        product,
+                        serial
+                    ));
+                }
+            }
+        }
+    }
+
+    if info.is_empty() {
+        Err(io::Error::new(io::ErrorKind::NotFound, "No USB devices found"))
+    } else {
+        Ok(info)
+    }
+}
+
+/// Retrieves the serial number of the disk at the given path.
+#[cfg(target_os = "linux")]
+pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
+    let output = Command::new("lsblk")
+        .args(["-o", "NAME,MOUNTPOINT,SERIAL", "-P"])
+        .output()?;
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    for line in out_str.lines() {
+        let mut name = "";
+        let mut mount = "";
+        let mut serial = "";
+        for kv in line.split_whitespace() {
+            if let Some(val) = kv.strip_prefix("NAME=") {
+                name = val.trim_matches('"');
+            } else if let Some(val) = kv.strip_prefix("MOUNTPOINT=") {
+                mount = val.trim_matches('"');
+            } else if let Some(val) = kv.strip_prefix("SERIAL=") {
+                serial = val.trim_matches('"');
+            }
+        }
+        if (!mount.is_empty() && disk_path.starts_with(mount)) ||
+           disk_path.ends_with(name) {
+            if !serial.is_empty() {
+                return Ok(serial.to_string());
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
+    let output = Command::new("wmic")
+        .args(["diskdrive", "get", "DeviceID,SerialNumber"])
+        .output()?;
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    for line in out_str.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let device_id = parts[0];
+            let serial = parts[1];
+            if disk_path.contains(device_id) || disk_path.to_lowercase().starts_with(device_id.to_lowercase().as_str()) {
+                return Ok(serial.to_string());
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
 }

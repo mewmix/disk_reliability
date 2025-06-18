@@ -13,6 +13,8 @@ aligned-vec = { version = "0.5.0", default-features = false, features = ["std"] 
 libc = "0.2.155"
 num_cpus = "1.16.0"
 crossbeam-channel = "0.5"
+sysinfo = "0.35"
+rusb = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [

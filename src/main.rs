@@ -25,6 +25,8 @@ use ctrlc;
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
 
+mod hardware_info;
+
 // Platform-specific imports
 #[cfg(all(target_os = "linux", feature = "direct"))]
 use std::os::unix::fs::OpenOptionsExt;
@@ -1721,6 +1723,46 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 initial_path_for_disk_info.display()
             ),
         );
+    }
+
+    if let Some(path_str) = initial_path_for_disk_info.to_str() {
+        if let Ok(dinfo) = hardware_info::get_disk_info(path_str) {
+            log_simple(&log_file_arc_opt, None, format!("Detailed Disk Info: {}", dinfo));
+        } else {
+            log_simple(&log_file_arc_opt, None, "Could not retrieve detailed disk info.");
+        }
+
+        if let Ok(serial) = hardware_info::get_disk_serial_number(path_str) {
+            log_simple(&log_file_arc_opt, None, format!("Disk Serial Number: {}", serial));
+        } else {
+            log_simple(&log_file_arc_opt, None, "Disk serial number unavailable.");
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(bsize) = hardware_info::get_block_size_windows(path_str) {
+                log_simple(&log_file_arc_opt, None, format!("Block Size: {} bytes", bsize));
+            }
+            if let Ok(usb) = hardware_info::get_usb_controller_info_windows(path_str) {
+                log_simple(&log_file_arc_opt, None, usb);
+            } else {
+                log_simple(&log_file_arc_opt, None, "USB controller information unavailable.");
+            }
+            if let Ok(serials) = hardware_info::get_usb_serial_numbers() {
+                log_simple(&log_file_arc_opt, None, serials);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(usb) = hardware_info::get_usb_controller_info_linux(path_str) {
+                log_simple(&log_file_arc_opt, None, usb);
+            } else {
+                log_simple(&log_file_arc_opt, None, "USB controller information unavailable.");
+            }
+            if let Ok(serials) = hardware_info::get_usb_serial_numbers() {
+                log_simple(&log_file_arc_opt, None, serials);
+            }
+        }
     }
 
     match cli.command {
