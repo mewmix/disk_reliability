@@ -1634,27 +1634,39 @@ fn full_reliability_test(
                 let (off_end_val, off_end_unit) = format_bytes_int(end_offset_bytes);
                 let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
                 let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
-                let pattern_label = if dual_pattern && msg.abs_start_sector % 2 == 0 {
-                    "random"
-                } else {
-                    match &*data_pattern_arc {
-                        DataTypePattern::Hex => "hex",
-                        DataTypePattern::Text => "text",
-                        DataTypePattern::Binary => "binary",
-                        DataTypePattern::File(_) => "file",
-                        DataTypePattern::Random => "random",
-                    }
-                };
-                log_simple(
-                    &log_f_opt,
-                    Some(&pb_arc),
-                    format!(
-                        "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
-                        pattern_label,
-                        write_mib,
-                        read_mib,
-                    ),
-                );
+// Determine the “base” (non-dual) label once
+let base_label = match &*data_pattern_arc {
+    DataTypePattern::Hex    => "hex",
+    DataTypePattern::Text   => "text",
+    DataTypePattern::Binary => "binary",
+    DataTypePattern::File(_)   => "file",
+    DataTypePattern::Random => "random",
+};
+
+// How many sectors make up one batch (already in scope)
+let sectors_per_batch = batch_size_sectors as u64;
+
+// 0-based batch number in THIS test run
+let batch_index = (msg.abs_start_sector - resume_from_sector) / sectors_per_batch;
+
+// Alternate every batch when --dual-pattern is set
+let pattern_label = if dual_pattern && batch_index % 2 == 0 {
+    "random"
+} else {
+    base_label
+};
+
+log_simple(
+    &log_f_opt,
+    Some(&pb_arc),
+    format!(
+        "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: \
+         {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
+        pattern_label,
+        write_mib,
+        read_mib,
+    ),
+);
 
                 if let Some(e) = msg.io_error {
                     counters_arc.increment_write_errors();
