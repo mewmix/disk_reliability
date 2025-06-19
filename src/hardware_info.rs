@@ -258,6 +258,7 @@ pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
     Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
 }
 
+
 #[cfg(target_os = "windows")]
 pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
     let output = Command::new("wmic")
@@ -294,4 +295,78 @@ pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
         }
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_disk_info_invalid() {
+        assert!(get_disk_info("unlikely_path_for_test").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_get_disk_info_root() {
+        let info = get_disk_info("/").unwrap();
+        assert!(info.contains("Disk: /"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_usb_controller_info_linux_invalid() {
+        assert!(get_usb_controller_info_linux("/unlikely_path_for_test").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_block_size_windows_invalid() {
+        assert!(get_block_size_windows("Q:\\nonexistent").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_get_disk_info_windows_root() {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let res = get_disk_info(&drive);
+        assert!(res.is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_block_size_macos_invalid() {
+        assert!(get_block_size_macos("/nonexistent").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_get_disk_info_macos_root() {
+        let res = get_disk_info("/");
+        assert!(res.is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_usb_controller_info_windows_invalid() {
+        assert!(get_usb_controller_info_windows("Z:").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_disk_serial_number_linux_invalid() {
+        assert!(get_disk_serial_number("/unlikely_path_for_test").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_disk_serial_number_windows_invalid() {
+        assert!(get_disk_serial_number("\\\\.\\Z:").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_disk_serial_number_macos_invalid() {
+        assert!(get_disk_serial_number("/nonexistent").is_err());
+    }
 }
