@@ -24,6 +24,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use ctrlc;
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
+use rand::{thread_rng, Rng};
 
 mod hardware_info;
 
@@ -89,6 +90,7 @@ enum DataTypeChoice {
     Text,
     Binary,
     File,
+    Random,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,7 @@ enum DataTypePattern {
     Text,
     Binary,
     File(Vec<u8>),
+    Random,
 }
 
 impl DataTypePattern {
@@ -143,6 +146,10 @@ impl DataTypePattern {
                     let source_idx = (offset_sector as usize * block_size + i) % source_buf.len();
                     buffer_slice[i] = source_buf[source_idx];
                 }
+            }
+            DataTypePattern::Random => {
+                let mut rng = thread_rng();
+                rng.fill(buffer_slice);
             }
         }
     }
@@ -216,6 +223,8 @@ enum Commands {
         direct_io: bool,
         #[clap(long)]
         preallocate: bool,
+        #[clap(long, help = "Alternate between random and sequential patterns during writes")]
+        dual_pattern: bool,
         #[clap(long, default_value_t = 1, help = "Number of passes for the full test (max 3).")]
         passes: usize,
     },
@@ -690,6 +699,11 @@ mod tests {
         assert_eq!(&buf_file, b"ABCDAB");
         DataTypePattern::File(src).fill_block_inplace(&mut buf_file, 1);
         assert_eq!(&buf_file, b"CDABCD");
+
+        let mut random_buf = vec![0u8; 32];
+        DataTypePattern::Random.fill_block_inplace(&mut random_buf, 0);
+        // ensure not all zeros
+        assert!(random_buf.iter().any(|&b| b != 0));
     }
 
     #[test]
@@ -1253,6 +1267,7 @@ fn full_reliability_test(
     batch_size_sectors: usize,
     direct_io: bool,
     preallocate: bool,
+    dual_pattern: bool,
     _verbose: bool,
 ) -> io::Result<()> {
     let block_size_usize = block_size_u64 as usize;
@@ -1536,10 +1551,17 @@ fn full_reliability_test(
                     let mut pattern_tile = alloc_buffer(block_size_usize, false);
                     for i in 0..this_batch_sectors {
                         let current_abs_sector = abs_first_sector + i as u64;
-                        data_pattern_arc.fill_block_inplace(
-                            &mut pattern_tile,
-                            current_abs_sector,
-                        );
+                        if dual_pattern && current_abs_sector % 2 == 0 {
+                            DataTypePattern::Random.fill_block_inplace(
+                                &mut pattern_tile,
+                                current_abs_sector,
+                            );
+                        } else {
+                            data_pattern_arc.fill_block_inplace(
+                                &mut pattern_tile,
+                                current_abs_sector,
+                            );
+                        }
                         let start = i * block_size_usize;
                         let end = start + block_size_usize;
                         target_buf[start..end].copy_from_slice(&pattern_tile);
@@ -1609,6 +1631,7 @@ fn full_reliability_test(
                     DataTypePattern::Text => "text",
                     DataTypePattern::Binary => "binary",
                     DataTypePattern::File(_) => "file",
+                    DataTypePattern::Random => "random",
                 };
                 log_simple(
                     &log_f_opt,
@@ -1978,6 +2001,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             #[cfg(feature = "direct")]
             direct_io,
             preallocate,
+            dual_pattern,
             passes,
         } => {
             #[cfg(feature = "direct")]
@@ -2020,6 +2044,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(ErrorKind::InvalidInput, "--data-file required for --data-type=file")
@@ -2097,6 +2122,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     actual_batch_size_sectors,
                     use_direct_io,
                     preallocate,
+                    dual_pattern,
                     cli.verbose,
                 )?;
 
@@ -2199,6 +2225,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(
@@ -2303,6 +2330,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(
@@ -2366,6 +2394,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(
