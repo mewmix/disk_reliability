@@ -49,6 +49,26 @@ pub fn get_block_size_windows(disk_path: &str) -> io::Result<u64> {
     Err(io::Error::new(io::ErrorKind::NotFound, "Block size not found"))
 }
 
+#[cfg(target_os = "macos")]
+pub fn get_block_size_macos(disk_path: &str) -> io::Result<u64> {
+    let output = Command::new("diskutil")
+        .args(["info", disk_path])
+        .output()?;
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    for line in output_str.lines() {
+        if line.trim_start().starts_with("Device Block Size:") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if let Some(size_part) = parts.get(1) {
+                let digits: String = size_part.chars().filter(|c| c.is_digit(10)).collect();
+                if let Ok(val) = digits.parse::<u64>() {
+                    return Ok(val);
+                }
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "Block size not found"))
+}
+
 /// Retrieves USB controller and vendor info for the disk on Windows.
 #[cfg(target_os = "windows")]
 pub fn get_usb_controller_info_windows(disk_path: &str) -> io::Result<String> {
@@ -127,6 +147,14 @@ pub fn get_usb_controller_info_linux(disk_path: &str) -> io::Result<String> {
     }
 
     Ok(format!("USB Controller Info: {}", matched_device))
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_usb_controller_info_macos(_disk_path: &str) -> io::Result<String> {
+    let output = Command::new("system_profiler")
+        .args(["SPUSBDataType"])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Lists connected USB devices and attempts to read their serial numbers using libusb.
@@ -245,6 +273,23 @@ pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
             let serial = parts[1];
             if disk_path.contains(device_id) || disk_path.to_lowercase().starts_with(device_id.to_lowercase().as_str()) {
                 return Ok(serial.to_string());
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
+    let output = Command::new("diskutil")
+        .args(["info", disk_path])
+        .output()?;
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    for line in out_str.lines() {
+        if line.trim_start().starts_with("Serial Number") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if let Some(sn) = parts.get(1) {
+                return Ok(sn.trim().to_string());
             }
         }
     }
