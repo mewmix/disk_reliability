@@ -392,6 +392,16 @@ fn get_hostname_os_impl() -> io::Result<String> {
     let len = buf.iter().position(|&x| x == 0).unwrap_or(buf.len());
     Ok(String::from_utf8_lossy(&buf[..len]).into_owned())
 }
+#[cfg(target_os = "macos")]
+fn get_hostname_os_impl() -> io::Result<String> {
+    let mut buf = vec![0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&x| x == 0).unwrap_or(buf.len());
+    Ok(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
 #[cfg(target_os = "windows")]
 fn get_hostname_os_impl() -> io::Result<String> {
     use std::os::windows::ffi::OsStringExt;
@@ -408,7 +418,7 @@ fn get_hostname_os_impl() -> io::Result<String> {
         .to_string_lossy()
         .into_owned())
 }
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn get_hostname_os_impl() -> io::Result<String> {
     Ok("Hostname_Not_Implemented_For_This_OS".to_string())
 }
@@ -523,7 +533,7 @@ fn open_file_options(
                 );
                 opts.custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH);
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 log_simple(
                     log_f,
@@ -1146,7 +1156,49 @@ fn preallocate_file_os(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>)
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn preallocate_file_os(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    #[repr(C)]
+    struct Fstore {
+        fst_flags: u32,
+        fst_posmode: i32,
+        fst_offset: i64,
+        fst_length: i64,
+        fst_bytesalloc: i64,
+    }
+    const F_ALLOCATECONTIG: u32 = 0x2;
+    const F_ALLOCATEALL: u32 = 0x4;
+    const F_PEOFPOSMODE: i32 = 3;
+    let mut store = Fstore {
+        fst_flags: F_ALLOCATECONTIG,
+        fst_posmode: F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: size as i64,
+        fst_bytesalloc: 0,
+    };
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &store) };
+    if ret == -1 {
+        store.fst_flags = F_ALLOCATEALL;
+        let ret_all = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &store) };
+        if ret_all == -1 {
+            log_simple(
+                log_f,
+                None,
+                format!(
+                    "F_PREALLOCATE failed: {}. Falling back to set_len.",
+                    io::Error::last_os_error()
+                ),
+            );
+            return file.set_len(size);
+        }
+    }
+    file.set_len(size)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn preallocate_file_os(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>) -> io::Result<()> {
     log_simple(
         log_f,
@@ -1842,6 +1894,25 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 log_simple(&log_file_arc_opt, None, format!("Block Size: {} bytes", bsize));
             }
             if let Ok(usb) = hardware_info::get_usb_controller_info_windows(path_str) {
+                log_simple(&log_file_arc_opt, None, usb);
+            } else {
+                log_simple(&log_file_arc_opt, None, "USB controller information unavailable.");
+            }
+            match hardware_info::get_usb_serial_numbers() {
+                Ok(serials) => log_simple(&log_file_arc_opt, None, serials),
+                Err(_) => log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    "No USB disk serial numbers found.",
+                ),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(bsize) = hardware_info::get_block_size_macos(path_str) {
+                log_simple(&log_file_arc_opt, None, format!("Block Size: {} bytes", bsize));
+            }
+            if let Ok(usb) = hardware_info::get_usb_controller_info_macos(path_str) {
                 log_simple(&log_file_arc_opt, None, usb);
             } else {
                 log_simple(&log_file_arc_opt, None, "USB controller information unavailable.");
