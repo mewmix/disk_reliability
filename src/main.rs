@@ -649,6 +649,9 @@ mod tests {
         assert_eq!(parse_size_with_suffix("1KB").unwrap(), 1024);
         assert_eq!(parse_size_with_suffix("1MiB").unwrap(), 1024 * 1024);
         assert_eq!(parse_size_with_suffix("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_with_suffix("1tb").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_size_with_suffix("256").unwrap(), 256);
+        assert_eq!(parse_size_with_suffix(" 512k ").unwrap(), 512 * 1024);
         assert!(parse_size_with_suffix("abc").is_err());
     }
 
@@ -661,6 +664,14 @@ mod tests {
     }
 
     #[test]
+    fn test_format_bytes_float() {
+        assert_eq!(format_bytes_float(512), (512.0, "Bytes"));
+        assert_eq!(format_bytes_float(2048), (2.0, "KiB"));
+        assert_eq!(format_bytes_float(3 * 1024 * 1024), (3.0, "MiB"));
+        assert_eq!(format_bytes_float(2 * 1024 * 1024 * 1024), (2.0, "GiB"));
+    }
+
+    #[test]
     fn test_data_pattern_fill_block() {
         let mut buf = vec![0u8; 16];
         DataTypePattern::Hex.fill_block_inplace(&mut buf, 0);
@@ -669,6 +680,16 @@ mod tests {
         DataTypePattern::Binary.fill_block_inplace(&mut buf, 1);
         let expected: Vec<u8> = (1u8..=16).collect();
         assert_eq!(buf, expected);
+
+        DataTypePattern::Text.fill_block_inplace(&mut buf, 0);
+        assert!(std::str::from_utf8(&buf).unwrap().starts_with("Lorem"));
+
+        let mut buf_file = vec![0u8; 6];
+        let src = b"ABCD".to_vec();
+        DataTypePattern::File(src.clone()).fill_block_inplace(&mut buf_file, 0);
+        assert_eq!(&buf_file, b"ABCDAB");
+        DataTypePattern::File(src).fill_block_inplace(&mut buf_file, 1);
+        assert_eq!(&buf_file, b"CDABCD");
     }
 
     #[test]
