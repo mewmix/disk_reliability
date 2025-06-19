@@ -24,6 +24,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use ctrlc;
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
+use rand::{thread_rng, Rng};
 
 mod hardware_info;
 
@@ -89,6 +90,7 @@ enum DataTypeChoice {
     Text,
     Binary,
     File,
+    Random,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,7 @@ enum DataTypePattern {
     Text,
     Binary,
     File(Vec<u8>),
+    Random,
 }
 
 impl DataTypePattern {
@@ -143,6 +146,10 @@ impl DataTypePattern {
                     let source_idx = (offset_sector as usize * block_size + i) % source_buf.len();
                     buffer_slice[i] = source_buf[source_idx];
                 }
+            }
+            DataTypePattern::Random => {
+                let mut rng = thread_rng();
+                rng.fill(buffer_slice);
             }
         }
     }
@@ -216,6 +223,8 @@ enum Commands {
         direct_io: bool,
         #[clap(long)]
         preallocate: bool,
+        #[clap(long, help = "Alternate between random and sequential patterns during writes")]
+        dual_pattern: bool,
         #[clap(long, default_value_t = 1, help = "Number of passes for the full test (max 3).")]
         passes: usize,
     },
@@ -690,6 +699,11 @@ mod tests {
         assert_eq!(&buf_file, b"ABCDAB");
         DataTypePattern::File(src).fill_block_inplace(&mut buf_file, 1);
         assert_eq!(&buf_file, b"CDABCD");
+
+        let mut random_buf = vec![0u8; 32];
+        DataTypePattern::Random.fill_block_inplace(&mut random_buf, 0);
+        // ensure not all zeros
+        assert!(random_buf.iter().any(|&b| b != 0));
     }
 
     #[test]
@@ -1253,6 +1267,7 @@ fn full_reliability_test(
     batch_size_sectors: usize,
     direct_io: bool,
     preallocate: bool,
+    dual_pattern: bool,
     _verbose: bool,
 ) -> io::Result<()> {
     let block_size_usize = block_size_u64 as usize;
@@ -1401,6 +1416,8 @@ fn full_reliability_test(
             abs_start_sector: u64,
             sector_count: u32,
             diff: Option<u32>, // offset-in-block if mismatch, else None
+            expected_byte: Option<u8>,
+            actual_byte: Option<u8>,
             io_error: Option<io::Error>,
             write_secs: f64,
             read_secs: f64,
@@ -1483,15 +1500,19 @@ fn full_reliability_test(
                         };
 
                         let mut diff = None;
+                        let mut expected_b = None;
+                        let mut actual_b = None;
                         if io_res.is_ok() {
-                            // Check for mismatch
                             if buf[..byte_len] != read_buf[..byte_len] {
-                                // Find first differing byte
-                                diff = buf
+                                if let Some(idx) = buf
                                     .iter()
                                     .zip(&read_buf[..byte_len])
                                     .position(|(a, b)| a != b)
-                                    .map(|i| i as u32);
+                                {
+                                    diff = Some(idx as u32);
+                                    expected_b = Some(buf[idx]);
+                                    actual_b = Some(read_buf[idx]);
+                                }
                             }
                         }
 
@@ -1500,6 +1521,8 @@ fn full_reliability_test(
                             abs_start_sector,
                             sector_count: sector_count as u32,
                             diff,
+                            expected_byte: expected_b,
+                            actual_byte: actual_b,
                             io_error: io_res.err(),
                             write_secs,
                             read_secs,
@@ -1536,10 +1559,17 @@ fn full_reliability_test(
                     let mut pattern_tile = alloc_buffer(block_size_usize, false);
                     for i in 0..this_batch_sectors {
                         let current_abs_sector = abs_first_sector + i as u64;
-                        data_pattern_arc.fill_block_inplace(
-                            &mut pattern_tile,
-                            current_abs_sector,
-                        );
+                        if dual_pattern && current_abs_sector % 2 == 0 {
+                            DataTypePattern::Random.fill_block_inplace(
+                                &mut pattern_tile,
+                                current_abs_sector,
+                            );
+                        } else {
+                            data_pattern_arc.fill_block_inplace(
+                                &mut pattern_tile,
+                                current_abs_sector,
+                            );
+                        }
                         let start = i * block_size_usize;
                         let end = start + block_size_usize;
                         target_buf[start..end].copy_from_slice(&pattern_tile);
@@ -1604,11 +1634,16 @@ fn full_reliability_test(
                 let (off_end_val, off_end_unit) = format_bytes_int(end_offset_bytes);
                 let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
                 let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
-                let pattern_label = match &*data_pattern_arc {
-                    DataTypePattern::Hex => "hex",
-                    DataTypePattern::Text => "text",
-                    DataTypePattern::Binary => "binary",
-                    DataTypePattern::File(_) => "file",
+                let pattern_label = if dual_pattern && msg.abs_start_sector % 2 == 0 {
+                    "random"
+                } else {
+                    match &*data_pattern_arc {
+                        DataTypePattern::Hex => "hex",
+                        DataTypePattern::Text => "text",
+                        DataTypePattern::Binary => "binary",
+                        DataTypePattern::File(_) => "file",
+                        DataTypePattern::Random => "random",
+                    }
                 };
                 log_simple(
                     &log_f_opt,
@@ -1637,13 +1672,21 @@ fn full_reliability_test(
                     );
                 } else if let Some(diff_offset) = msg.diff {
                     counters_arc.increment_mismatches();
+                    let detail = if let (Some(exp_b), Some(act_b)) = (msg.expected_byte, msg.actual_byte) {
+                        format!(
+                            "First mismatch at byte offset {} in batch (wrote {:02X} vs read {:02X})",
+                            diff_offset, exp_b, act_b
+                        )
+                    } else {
+                        format!("First mismatch at byte offset {} in batch", diff_offset)
+                    };
                     log_error(
                         &log_f_opt,
                         Some(&pb_arc),
                         0,
                         msg.abs_start_sector,
                         "Data Mismatch",
-                        &format!("First mismatch at byte offset {} in batch", diff_offset),
+                        &detail,
                         None,
                         None,
                         Some(file_path_owned.clone()),
@@ -1978,6 +2021,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             #[cfg(feature = "direct")]
             direct_io,
             preallocate,
+            dual_pattern,
             passes,
         } => {
             #[cfg(feature = "direct")]
@@ -2020,6 +2064,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(ErrorKind::InvalidInput, "--data-file required for --data-type=file")
@@ -2097,6 +2142,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     actual_batch_size_sectors,
                     use_direct_io,
                     preallocate,
+                    dual_pattern,
                     cli.verbose,
                 )?;
 
@@ -2199,6 +2245,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(
@@ -2303,6 +2350,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(
@@ -2366,6 +2414,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 DataTypeChoice::Hex => DataTypePattern::Hex,
                 DataTypeChoice::Text => DataTypePattern::Text,
                 DataTypeChoice::Binary => DataTypePattern::Binary,
+                DataTypeChoice::Random => DataTypePattern::Random,
                 DataTypeChoice::File => {
                     let df_path = data_file.ok_or_else(|| {
                         io::Error::new(
