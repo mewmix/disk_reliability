@@ -2016,7 +2016,11 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
     setup_signal_handler();
     let cli = Cli::parse();
     log_simple(&log_file_arc_opt, None, "Starting Disk Test Tool...");
-
+    log_simple(
+        &log_file_arc_opt,
+        None,
+        format!("Running Version {}", env!("CARGO_PKG_VERSION")),
+    );
     if cli.verbose {
         log_simple(&log_file_arc_opt, None, format!("CLI Command: {:?}", cli));
     }
