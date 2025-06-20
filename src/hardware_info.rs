@@ -172,6 +172,52 @@ pub fn get_usb_controller_info_macos(_disk_path: &str) -> io::Result<String> {
 }
 
 #[cfg(target_os = "windows")]
+#[repr(C)]
+struct STORAGE_PROPERTY_QUERY {
+    PropertyId: u32,
+    QueryType: u32,
+    AdditionalParameters: [u8; 1],
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct STORAGE_DEVICE_DESCRIPTOR {
+    Version: u32,
+    Size: u32,
+    DeviceType: u8,
+    DeviceTypeModifier: u8,
+    RemovableMedia: u8,
+    CommandQueueing: u8,
+    VendorIdOffset: u32,
+    ProductIdOffset: u32,
+    ProductRevisionOffset: u32,
+    SerialNumberOffset: u32,
+    BusType: u8,
+    RawPropertiesLength: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct STORAGE_SEEK_PENALTY_DESCRIPTOR {
+    Version: u32,
+    Size: u32,
+    IncursSeekPenalty: winapi::shared::minwindef::BOOLEAN,
+}
+
+#[cfg(target_os = "windows")]
+const BUS_TYPE_USB: u8 = 7;
+#[cfg(target_os = "windows")]
+const BUS_TYPE_NVME: u8 = 17;
+#[cfg(target_os = "windows")]
+const BUS_TYPE_SATA: u8 = 11;
+#[cfg(target_os = "windows")]
+const BUS_TYPE_ATA: u8 = 3;
+#[cfg(target_os = "windows")]
+const BUS_TYPE_SD: u8 = 12;
+#[cfg(target_os = "windows")]
+const BUS_TYPE_MMC: u8 = 13;
+
+#[cfg(target_os = "windows")]
 pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
     use std::{mem, os::windows::prelude::*, ptr};
     use winapi::ctypes::c_void;
@@ -179,10 +225,6 @@ pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
         fileapi::CreateFileW,
         handleapi::CloseHandle,
         winbase::FILE_FLAG_BACKUP_SEMANTICS,
-        winioctl::{
-            IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_BUS_TYPE, STORAGE_DEVICE_DESCRIPTOR,
-            STORAGE_PROPERTY_QUERY, STORAGE_SEEK_PENALTY_DESCRIPTOR,
-        },
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE},
         ioapiset::DeviceIoControl,
     };
@@ -190,6 +232,7 @@ pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
     const PropertyStandardQuery: u32 = 0;
     const StorageDeviceProperty: u32 = 0;
     const StorageDeviceSeekPenaltyProperty: u32 = 7;
+    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1400;
 
     let mut dev_path = format!(r"\\.\{}", drive.trim_end_matches(':'));
     if !dev_path.ends_with(':') {
@@ -238,15 +281,11 @@ pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
         }
         let desc: &STORAGE_DEVICE_DESCRIPTOR = &*(buf.as_ptr() as *const _);
         let bus = match desc.BusType {
-            x if x == STORAGE_BUS_TYPE::BusTypeUsb as u8 => "USB",
-            x if x == STORAGE_BUS_TYPE::BusTypeNvme as u8 => "NVMe",
-            x if x == STORAGE_BUS_TYPE::BusTypeSata as u8
-                || x == STORAGE_BUS_TYPE::BusTypeAta as u8 =>
-            {
-                "SATA"
-            }
-            x if x == STORAGE_BUS_TYPE::BusTypeSd as u8 => "SD-card",
-            x if x == STORAGE_BUS_TYPE::BusTypeMmc as u8 => "eMMC",
+            BUS_TYPE_USB => "USB",
+            BUS_TYPE_NVME => "NVMe",
+            x if x == BUS_TYPE_SATA || x == BUS_TYPE_ATA => "SATA",
+            BUS_TYPE_SD => "SD-card",
+            BUS_TYPE_MMC => "eMMC",
             _ => "Other/Unknown",
         };
 
