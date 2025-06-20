@@ -62,13 +62,15 @@ mod windows {
     use super::*;
     use std::{mem, os::windows::prelude::*, ptr};
     use winapi::ctypes::c_void;
+    use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
+    use winapi::shared::winioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
     use winapi::um::{
         fileapi::CreateFileW,
+        handleapi::CloseHandle,
         winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED},
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, HANDLE},
         ioapiset::DeviceIoControl,
     };
-    use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
 
     #[repr(C)]
     struct STORAGE_PROPERTY_QUERY {
@@ -78,40 +80,30 @@ mod windows {
     }
     const StorageDeviceProperty: u32 = 0;
     const PropertyStandardQuery: u32 = 0;
-    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1400;
+const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1400;
 
-    #[repr(C)]
-    struct STORAGE_DEVICE_DESCRIPTOR {
-        version: u32,
-        size: u32,
-        device_type: u8,
-        device_type_modifier: u8,
-        removable_media: u8,
-        command_queueing: u8,
-        vendor_id_offset: u32,
-        product_id_offset: u32,
-        product_revision_offset: u32,
-        serial_number_offset: u32,
-        bus_type: u8,
-        raw_properties_length: u32,
-        // followed by raw data
+    unsafe fn physical_drive_from_letter(handle: HANDLE) -> io::Result<String> {
+        let mut dev_num: STORAGE_DEVICE_NUMBER = mem::zeroed();
+        let mut bytes = 0u32;
+        let ok = DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            ptr::null_mut(),
+            0,
+            &mut dev_num as *mut _ as *mut _,
+            mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+            &mut bytes,
+            ptr::null_mut(),
+        );
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(format!(r"\\.\PhysicalDrive{}", dev_num.DeviceNumber))
+        }
     }
 
-    pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
-        // -------- drive-letter →  \\.\X:  ------------------------------------
-        // Accept  "D:",  "D:\\",  "D:/"  or a ready-made device path.
-        let s = dev.as_ref().display().to_string();
-        let device = if let Some(letter) = s.chars().next()
-            .filter(|c| c.is_ascii_alphabetic())
-            .filter(|_| s.len() == 2 || s.starts_with(r":\\") || s.starts_with(r":/"))
-        {
-            format!(r"\\\.\{}:", letter.to_ascii_uppercase())
-        } else {
-            // Already something like  \\.\PhysicalDrive3  – trust the caller.
-            s
-        };
-
-        let wide: Vec<u16> = std::ffi::OsStr::new(&device)
+    fn query_serial(device_path: &str) -> Result<String> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(device_path)
             .encode_wide()
             .chain(Some(0))
             .collect();
@@ -148,27 +140,88 @@ mod windows {
                 &mut bytes,
                 ptr::null_mut(),
             );
-            if ok == 0 {
+            let result = if ok == 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-                    return Err(SerialError::Other);
+                    Err(SerialError::Other)
+                } else {
+                    Err(SerialError::Io(err))
                 }
-                return Err(err.into());
+            } else {
+                let desc: &STORAGE_DEVICE_DESCRIPTOR = &*(buf.as_ptr() as *const _);
+                if desc.serial_number_offset == 0 {
+                    Err(SerialError::NotFound)
+                } else {
+                    let offset = desc.serial_number_offset as usize;
+                    let nul = buf[offset..].iter().position(|&b| b == 0).unwrap_or(0);
+                    let s = String::from_utf8_lossy(&buf[offset..offset + nul]).trim().to_owned();
+                    if s.is_empty() {
+                        Err(SerialError::NotFound)
+                    } else {
+                        Ok(s)
+                    }
+                }
+            };
+            CloseHandle(handle);
+            result
+        }
+    }
+
+    #[repr(C)]
+    struct STORAGE_DEVICE_DESCRIPTOR {
+        version: u32,
+        size: u32,
+        device_type: u8,
+        device_type_modifier: u8,
+        removable_media: u8,
+        command_queueing: u8,
+        vendor_id_offset: u32,
+        product_id_offset: u32,
+        product_revision_offset: u32,
+        serial_number_offset: u32,
+        bus_type: u8,
+        raw_properties_length: u32,
+        // followed by raw data
+    }
+
+    pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
+        // -------- drive-letter (D:, D:\, D:/) →  \\.\D: -------------------
+        let s = dev.as_ref().display().to_string();
+        let (mut device_path, is_letter) = match s.chars().next() {
+            Some(c) if c.is_ascii_alphabetic()
+                && (s.len() == 2 || s.starts_with(":\\") || s.starts_with(":/")) =>
+            {
+                (format!(r"\\\.\{}:", c.to_ascii_uppercase()), true)
+            }
+            _ => (s, false),
+        };
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(&device_path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+
+        unsafe {
+            let h = CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                3, // OPEN_EXISTING
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            );
+            if h.is_null() {
+                return Err(io::Error::last_os_error().into());
             }
 
-            let desc: &STORAGE_DEVICE_DESCRIPTOR = &*(buf.as_ptr() as *const _);
-            if desc.serial_number_offset == 0 {
-                return Err(SerialError::NotFound);
+            if is_letter {
+                device_path = physical_drive_from_letter(h)?;
             }
-            let offset = desc.serial_number_offset as usize;
-            let nul = buf[offset..].iter().position(|&b| b == 0).unwrap_or(0);
-            let s = String::from_utf8_lossy(&buf[offset..offset + nul]).trim().to_owned();
-            if s.is_empty() {
-                Err(SerialError::NotFound)
-            } else {
-                Ok(s)
-            }
+            CloseHandle(h);
         }
+
+        query_serial(&device_path)
     }
 }
 
