@@ -18,6 +18,14 @@ rusb = "0.9"
 rand = "0.8"
 cfg-if = "1.0"
 thiserror = "2"
+winapi = { version = "0.3.9", features = [
+    "fileapi",
+    "handleapi",
+    "ioapiset",
+    "winbase",
+    "winnt",
+    "winioctl"      # <- add this
+] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [
