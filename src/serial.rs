@@ -195,7 +195,7 @@ mod windows {
             Some(c) if c.is_ascii_alphabetic()
                 && (s.len() == 2 || s.starts_with(":\\") || s.starts_with(":/")) =>
             {
-                (format!(r"\\\.\{}:", c.to_ascii_uppercase()), true)
+                (format!(r"\\.\{}:", c.to_ascii_uppercase()), true)
             }
             _ => (s, false),
         };
