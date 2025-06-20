@@ -98,9 +98,20 @@ mod windows {
     }
 
     pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
-        let wide: Vec<u16> = dev
-            .as_ref()
-            .as_os_str()
+        // -------- drive-letter →  \\.\X:  ------------------------------------
+        // Accept  "D:",  "D:\\",  "D:/"  or a ready-made device path.
+        let s = dev.as_ref().display().to_string();
+        let device = if let Some(letter) = s.chars().next()
+            .filter(|c| c.is_ascii_alphabetic())
+            .filter(|_| s.len() == 2 || s.starts_with(r":\\") || s.starts_with(r":/"))
+        {
+            format!(r"\\\.\{}:", letter.to_ascii_uppercase())
+        } else {
+            // Already something like  \\.\PhysicalDrive3  – trust the caller.
+            s
+        };
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(&device)
             .encode_wide()
             .chain(Some(0))
             .collect();
