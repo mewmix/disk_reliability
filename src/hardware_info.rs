@@ -243,6 +243,12 @@ pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
     }
 }
 
+/// Retrieve NVMe SMART/health information for the given disk path on Windows.
+#[cfg(target_os = "windows")]
+pub fn get_nvme_smart_info(disk_path: &str) -> io::Result<(crate::drive_info::windows::DeviceDescriptor, crate::drive_info::windows::NvmeSmart)> {
+    crate::drive_info::windows::query_drive(disk_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

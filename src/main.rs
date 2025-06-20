@@ -28,6 +28,7 @@ use rand::{thread_rng, Rng};
 
 mod hardware_info;
 mod serial;
+mod drive_info;
 
 // Platform-specific imports
 #[cfg(all(target_os = "linux", feature = "direct"))]
@@ -301,6 +302,10 @@ enum Commands {
         #[cfg(feature = "direct")]
         #[clap(long)]
         direct_io: bool,
+    },
+    DriveInfo {
+        #[clap(long)]
+        path: PathBuf,
     },
 }
 
@@ -2034,7 +2039,8 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
         | Commands::WriteSector { path, .. }
         | Commands::RangeRead { path, .. }
         | Commands::RangeWrite { path, .. }
-        | Commands::VerifyRange { path, .. } => path.as_path(),
+        | Commands::VerifyRange { path, .. }
+        | Commands::DriveInfo { path, .. } => path.as_path(),
     };
     if let Ok(info) = get_disk_info(initial_path_for_disk_info) {
         log_simple(&log_file_arc_opt, None, &info);
@@ -2575,6 +2581,30 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 );
                 log_simple(&log_file_arc_opt, None, &summary_msg);
                 return Err(io::Error::new(ErrorKind::InvalidData, summary_msg));
+            }
+        }
+        Commands::DriveInfo { path } => {
+            if let Some(p) = path.to_str() {
+                if let Ok(info) = hardware_info::get_disk_info(p) {
+                    log_simple(&log_file_arc_opt, None, format!("Detailed Disk Info: {}", info));
+                } else {
+                    log_simple(&log_file_arc_opt, None, "Could not retrieve detailed disk info.");
+                }
+                if let Ok(serial) = hardware_info::get_disk_serial_number(p) {
+                    log_simple(&log_file_arc_opt, None, format!("Disk Serial Number: {}", serial));
+                } else {
+                    log_simple(&log_file_arc_opt, None, "Disk serial number unavailable.");
+                }
+                #[cfg(target_os = "windows")]
+                match hardware_info::get_nvme_smart_info(p) {
+                    Ok((desc, smart)) => {
+                        log_simple(&log_file_arc_opt, None, format!("{}  FW:{}  SN:{}", desc.model, desc.firmware, desc.serial));
+                        log_simple(&log_file_arc_opt, None, format!("Temp {} °C, Power-on {} h, Data written {} GB", smart.temperature_C, smart.power_on_hours, smart.data_units_written / 1953125));
+                    }
+                    Err(e) => log_simple(&log_file_arc_opt, None, format!("Failed to query NVMe SMART: {}", e)),
+                }
+            } else {
+                log_simple(&log_file_arc_opt, None, "Invalid path");
             }
         }
     }
