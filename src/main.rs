@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 
 mod hardware_info;
+mod serial;
 
 // Platform-specific imports
 #[cfg(all(target_os = "linux", feature = "direct"))]

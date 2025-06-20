@@ -228,73 +228,19 @@ pub fn get_usb_serial_numbers() -> io::Result<String> {
     }
 }
 
-/// Retrieves the serial number of the disk at the given path.
-#[cfg(target_os = "linux")]
+/// Retrieves the serial number of the disk at the given path using the
+/// platform specific implementation in [`crate::serial`].
 pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
-    let output = Command::new("lsblk")
-        .args(["-o", "NAME,MOUNTPOINT,SERIAL", "-P"])
-        .output()?;
-    let out_str = String::from_utf8_lossy(&output.stdout);
-    for line in out_str.lines() {
-        let mut name = "";
-        let mut mount = "";
-        let mut serial = "";
-        for kv in line.split_whitespace() {
-            if let Some(val) = kv.strip_prefix("NAME=") {
-                name = val.trim_matches('"');
-            } else if let Some(val) = kv.strip_prefix("MOUNTPOINT=") {
-                mount = val.trim_matches('"');
-            } else if let Some(val) = kv.strip_prefix("SERIAL=") {
-                serial = val.trim_matches('"');
-            }
+    match crate::serial::disk_serial(disk_path) {
+        Ok(s) => Ok(s),
+        Err(crate::serial::SerialError::NotFound) => {
+            Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
         }
-        if (!mount.is_empty() && disk_path.starts_with(mount)) ||
-           disk_path.ends_with(name) {
-            if !serial.is_empty() {
-                return Ok(serial.to_string());
-            }
+        Err(crate::serial::SerialError::Io(e)) => Err(e),
+        Err(crate::serial::SerialError::Other) => {
+            Err(io::Error::new(io::ErrorKind::Other, "Unknown error"))
         }
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
-}
-
-
-#[cfg(target_os = "windows")]
-pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
-    let output = Command::new("wmic")
-        .args(["diskdrive", "get", "DeviceID,SerialNumber"])
-        .output()?;
-    let out_str = String::from_utf8_lossy(&output.stdout);
-    for line in out_str.lines().skip(1) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let device_id = parts[0];
-            let serial = parts[1];
-            if disk_path.contains(device_id) || disk_path.to_lowercase().starts_with(device_id.to_lowercase().as_str()) {
-                return Ok(serial.to_string());
-            }
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
-}
-
-#[cfg(target_os = "macos")]
-pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
-    let output = Command::new("diskutil")
-        .args(["info", disk_path])
-        .output()?;
-    let out_str = String::from_utf8_lossy(&output.stdout);
-    for line in out_str.lines() {
-        if line.trim_start().starts_with("Serial Number") {
-            let parts: Vec<&str> = line.split(':').collect();
-            if let Some(sn) = parts.get(1) {
-                return Ok(sn.trim().to_string());
-            }
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
 }
 
 #[cfg(test)]

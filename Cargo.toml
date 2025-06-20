@@ -16,6 +16,8 @@ crossbeam-channel = "0.5"
 sysinfo = "0.35"
 rusb = "0.9"
 rand = "0.8"
+cfg-if = "1.0"
+thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [
@@ -23,7 +25,15 @@ winapi = { version = "0.3.9", features = [
     "minwinbase",   # For FILE_ALLOCATION_INFO struct definition
     "winbase",      # For GetComputerNameW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH
     "winnt",        # For HANDLE, ULARGE_INTEGER (definition), also where FileAllocationInfo enum member is defined for FILE_INFO_BY_HANDLE_CLASS
+    "ioapiset",     # For DeviceIoControl
+    "winerror",     # For ERROR_INSUFFICIENT_BUFFER constant
 ]}
+
+[target.'cfg(target_os = "linux")'.dependencies]
+udev = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ioreg = "0.1"
 
 [features]
 direct = []
