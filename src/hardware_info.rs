@@ -7,8 +7,8 @@ use std::time::Duration;
 use rusb::{Context, DeviceHandle, UsbContext};
 
 /// Retrieves information about the disk at the given path.
-pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
-    let mut disks = Disks::new_with_refreshed_list();
+fn get_disk_info_base(disk_path: &str) -> io::Result<String> {
+    let disks = Disks::new_with_refreshed_list();
     for disk in disks.list() {
         let mount_point_cow = disk.mount_point().to_string_lossy();
         let mount_point_str = mount_point_cow.as_ref();
@@ -24,6 +24,20 @@ pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
     }
 
     Err(io::Error::new(io::ErrorKind::NotFound, "Disk not found"))
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
+    let base = get_disk_info_base(disk_path)?;
+    match classify_media_windows(disk_path) {
+        Ok((bus, media)) => Ok(format!("{base}\nBus: {bus}\nMedia: {media}")),
+        Err(_) => Ok(format!("{base}\nBus/Media: unavailable")),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
+    get_disk_info_base(disk_path)
 }
 
 /// Get the block size for a given disk path (OS-specific)
@@ -155,6 +169,118 @@ pub fn get_usb_controller_info_macos(_disk_path: &str) -> io::Result<String> {
         .args(["SPUSBDataType"])
         .output()?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(target_os = "windows")]
+pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
+    use std::{mem, os::windows::prelude::*, ptr};
+    use winapi::ctypes::c_void;
+    use winapi::um::{
+        fileapi::CreateFileW,
+        handleapi::CloseHandle,
+        winbase::FILE_FLAG_BACKUP_SEMANTICS,
+        winioctl::{
+            IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_BUS_TYPE, STORAGE_DEVICE_DESCRIPTOR,
+            STORAGE_PROPERTY_QUERY, STORAGE_SEEK_PENALTY_DESCRIPTOR,
+        },
+        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE},
+        ioapiset::DeviceIoControl,
+    };
+
+    const PropertyStandardQuery: u32 = 0;
+    const StorageDeviceProperty: u32 = 0;
+    const StorageDeviceSeekPenaltyProperty: u32 = 7;
+
+    let mut dev_path = format!(r"\\.\{}", drive.trim_end_matches(':'));
+    if !dev_path.ends_with(':') {
+        dev_path.push(':');
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&dev_path)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    unsafe {
+        let h: HANDLE = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null_mut(),
+            3,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        );
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut buf = [0u8; 512];
+        let mut out = 0u32;
+        let ok = DeviceIoControl(
+            h,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *mut c_void,
+            mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut out,
+            ptr::null_mut(),
+        );
+        if ok == 0 {
+            let e = io::Error::last_os_error();
+            CloseHandle(h);
+            return Err(e);
+        }
+        let desc: &STORAGE_DEVICE_DESCRIPTOR = &*(buf.as_ptr() as *const _);
+        let bus = match desc.BusType {
+            x if x == STORAGE_BUS_TYPE::BusTypeUsb as u8 => "USB",
+            x if x == STORAGE_BUS_TYPE::BusTypeNvme as u8 => "NVMe",
+            x if x == STORAGE_BUS_TYPE::BusTypeSata as u8
+                || x == STORAGE_BUS_TYPE::BusTypeAta as u8 =>
+            {
+                "SATA"
+            }
+            x if x == STORAGE_BUS_TYPE::BusTypeSd as u8 => "SD-card",
+            x if x == STORAGE_BUS_TYPE::BusTypeMmc as u8 => "eMMC",
+            _ => "Other/Unknown",
+        };
+
+        let query_seek = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceSeekPenaltyProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut seek_desc: STORAGE_SEEK_PENALTY_DESCRIPTOR = mem::zeroed();
+        let ok2 = DeviceIoControl(
+            h,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query_seek as *const _ as *mut c_void,
+            mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            &mut seek_desc as *mut _ as *mut c_void,
+            mem::size_of::<STORAGE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut out,
+            ptr::null_mut(),
+        );
+        CloseHandle(h);
+        if ok2 == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let media = if seek_desc.IncursSeekPenalty == 0 {
+            match bus {
+                "USB" | "SD-card" | "eMMC" => "Flash",
+                "NVMe" | "SATA" => "SSD",
+                _ => "Solid-state",
+            }
+        } else {
+            "HDD"
+        };
+        Ok((bus.into(), media.into()))
+    }
 }
 
 /// Lists connected USB devices and attempts to read their serial numbers using libusb.
