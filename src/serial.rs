@@ -63,7 +63,12 @@ mod windows {
     use std::{mem, os::windows::prelude::*, ptr};
     use winapi::ctypes::c_void;
     use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
-    use winapi::shared::winioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
+    use winapi::um::winioctl::{
+    IOCTL_STORAGE_GET_DEVICE_NUMBER,
+    STORAGE_DEVICE_NUMBER,
+    IOCTL_STORAGE_QUERY_PROPERTY,
+};
+    
     use winapi::um::{
         fileapi::CreateFileW,
         handleapi::CloseHandle,
@@ -80,7 +85,6 @@ mod windows {
     }
     const StorageDeviceProperty: u32 = 0;
     const PropertyStandardQuery: u32 = 0;
-const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1400;
 
     unsafe fn physical_drive_from_letter(handle: HANDLE) -> io::Result<String> {
         let mut dev_num: STORAGE_DEVICE_NUMBER = mem::zeroed();
