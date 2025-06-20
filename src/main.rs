@@ -724,6 +724,34 @@ mod tests {
 
         single_sector_read(&log, path, 0, 16, false).unwrap();
     }
+
+    #[test]
+    fn test_dual_pattern_split_in_batch() {
+        let block_size = 8;
+        let sectors = 4;
+        let pattern = DataTypePattern::Binary;
+        let mut buf = vec![0u8; block_size * sectors];
+        let mut tile = vec![0u8; block_size];
+        let split = sectors / 2;
+        for i in 0..sectors {
+            let abs = i as u64;
+            if i < split {
+                pattern.fill_block_inplace(&mut tile, abs);
+            } else {
+                DataTypePattern::Random.fill_block_inplace(&mut tile, abs);
+            }
+            let start = i * block_size;
+            buf[start..start + block_size].copy_from_slice(&tile);
+        }
+
+        let mut expected_first = vec![0u8; block_size];
+        pattern.fill_block_inplace(&mut expected_first, 0);
+        assert_eq!(&buf[0..block_size], &expected_first);
+
+        let mut expected_second = vec![0u8; block_size];
+        pattern.fill_block_inplace(&mut expected_second, split as u64);
+        assert_ne!(&buf[split * block_size..(split + 1) * block_size], &expected_second);
+    }
 }
 
 fn single_sector_write(
@@ -1419,8 +1447,10 @@ fn full_reliability_test(
             expected_byte: Option<u8>,
             actual_byte: Option<u8>,
             io_error: Option<io::Error>,
-            write_secs: f64,
-            read_secs: f64,
+            write_secs_first: f64,
+            read_secs_first: f64,
+            write_secs_second: f64,
+            read_secs_second: f64,
             buf: AlignedVec<u8>, // The buffer is returned for reuse
         }
 
@@ -1474,27 +1504,66 @@ fn full_reliability_test(
                         let byte_len = sector_count * block_size_usize;
                         let byte_offs = abs_start_sector * block_size_u64;
 
-                        let mut write_secs = 0.0f64;
-                        let mut read_secs = 0.0f64;
+                        let mut write_secs_first = 0.0f64;
+                        let mut read_secs_first = 0.0f64;
+                        let mut write_secs_second = 0.0f64;
+                        let mut read_secs_second = 0.0f64;
 
                         let seek_res = f.seek(SeekFrom::Start(byte_offs));
                         let io_res = if let Err(e) = seek_res {
                             Err(e)
                         } else {
-                            let w_start = Instant::now();
-                            let w_res = f.write_all(&buf[..byte_len]);
-                            write_secs = w_start.elapsed().as_secs_f64();
-                            if w_res.is_err() {
-                                w_res
-                            } else {
-                                let seek_res2 = f.seek(SeekFrom::Start(byte_offs));
-                                if let Err(e) = seek_res2 {
+                            if dual_pattern {
+                                let split = sector_count / 2;
+                                let first_len = split * block_size_usize;
+                                // Remaining bytes for the random half
+
+                                let w_start = Instant::now();
+                                let w_res = f.write_all(&buf[..first_len]);
+                                write_secs_first = w_start.elapsed().as_secs_f64();
+                                if let Err(e) = w_res {
                                     Err(e)
                                 } else {
-                                    let r_start = Instant::now();
-                                    let r_res = f.read_exact(&mut read_buf[..byte_len]);
-                                    read_secs = r_start.elapsed().as_secs_f64();
-                                    r_res
+                                    let w_start2 = Instant::now();
+                                    let w_res2 = f.write_all(&buf[first_len..byte_len]);
+                                    write_secs_second = w_start2.elapsed().as_secs_f64();
+                                    if let Err(e) = w_res2 {
+                                        Err(e)
+                                    } else {
+                                        let seek_res2 = f.seek(SeekFrom::Start(byte_offs));
+                                        if let Err(e) = seek_res2 {
+                                            Err(e)
+                                        } else {
+                                            let r_start = Instant::now();
+                                            let r_res = f.read_exact(&mut read_buf[..first_len]);
+                                            read_secs_first = r_start.elapsed().as_secs_f64();
+                                            if let Err(e) = r_res {
+                                                Err(e)
+                                            } else {
+                                                let r_start2 = Instant::now();
+                                                let r_res2 = f.read_exact(&mut read_buf[first_len..byte_len]);
+                                                read_secs_second = r_start2.elapsed().as_secs_f64();
+                                                r_res2
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                let w_start = Instant::now();
+                                let w_res = f.write_all(&buf[..byte_len]);
+                                write_secs_first = w_start.elapsed().as_secs_f64();
+                                if w_res.is_err() {
+                                    w_res
+                                } else {
+                                    let seek_res2 = f.seek(SeekFrom::Start(byte_offs));
+                                    if let Err(e) = seek_res2 {
+                                        Err(e)
+                                    } else {
+                                        let r_start = Instant::now();
+                                        let r_res = f.read_exact(&mut read_buf[..byte_len]);
+                                        read_secs_first = r_start.elapsed().as_secs_f64();
+                                        r_res
+                                    }
                                 }
                             }
                         };
@@ -1524,8 +1593,10 @@ fn full_reliability_test(
                             expected_byte: expected_b,
                             actual_byte: actual_b,
                             io_error: io_res.err(),
-                            write_secs,
-                            read_secs,
+                            write_secs_first,
+                            read_secs_first,
+                            write_secs_second,
+                            read_secs_second,
                             buf, // return the buffer for reuse
                         });
                     }
@@ -1557,13 +1628,21 @@ fn full_reliability_test(
 
                     // Generate pattern for the whole batch at once
                     let mut pattern_tile = alloc_buffer(block_size_usize, false);
+                    let split_point = this_batch_sectors / 2;
                     for i in 0..this_batch_sectors {
                         let current_abs_sector = abs_first_sector + i as u64;
-                        if dual_pattern && current_abs_sector % 2 == 0 {
-                            DataTypePattern::Random.fill_block_inplace(
-                                &mut pattern_tile,
-                                current_abs_sector,
-                            );
+                        if dual_pattern {
+                            if i < split_point {
+                                data_pattern_arc.fill_block_inplace(
+                                    &mut pattern_tile,
+                                    current_abs_sector,
+                                );
+                            } else {
+                                DataTypePattern::Random.fill_block_inplace(
+                                    &mut pattern_tile,
+                                    current_abs_sector,
+                                );
+                            }
                         } else {
                             data_pattern_arc.fill_block_inplace(
                                 &mut pattern_tile,
@@ -1618,55 +1697,73 @@ fn full_reliability_test(
                 pb_arc.inc(msg.sector_count as u64);
 
                 let batch_bytes = msg.sector_count as u64 * block_size_u64;
-                let write_mib = if msg.write_secs > 0.0 {
-                    (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs
-                } else {
-                    0.0
-                };
-                let read_mib = if msg.read_secs > 0.0 {
-                    (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs
-                } else {
-                    0.0
-                };
+                let split = if dual_pattern { msg.sector_count as usize / 2 } else { msg.sector_count as usize };
+                let first_bytes = split as u64 * block_size_u64;
+                let second_bytes = batch_bytes - first_bytes;
+
+                let write_mib_first = if msg.write_secs_first > 0.0 {
+                    (first_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs_first
+                } else { 0.0 };
+                let read_mib_first = if msg.read_secs_first > 0.0 {
+                    (first_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs_first
+                } else { 0.0 };
+                let write_mib_second = if dual_pattern && msg.write_secs_second > 0.0 {
+                    (second_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs_second
+                } else { 0.0 };
+                let read_mib_second = if dual_pattern && msg.read_secs_second > 0.0 {
+                    (second_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs_second
+                } else { 0.0 };
                 let offset_bytes = msg.abs_start_sector * block_size_u64;
                 let end_offset_bytes = offset_bytes + batch_bytes;
                 let (off_start_val, off_start_unit) = format_bytes_int(offset_bytes);
                 let (off_end_val, off_end_unit) = format_bytes_int(end_offset_bytes);
                 let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
                 let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
-// Determine the “base” (non-dual) label once
-let base_label = match &*data_pattern_arc {
-    DataTypePattern::Hex    => "hex",
-    DataTypePattern::Text   => "text",
-    DataTypePattern::Binary => "binary",
-    DataTypePattern::File(_)   => "file",
-    DataTypePattern::Random => "random",
-};
+                // Determine the "base" (non-dual) label once
+                let base_label = match &*data_pattern_arc {
+                    DataTypePattern::Hex => "hex",
+                    DataTypePattern::Text => "text",
+                    DataTypePattern::Binary => "binary",
+                    DataTypePattern::File(_) => "file",
+                    DataTypePattern::Random => "random",
+                };
 
-// How many sectors make up one batch (already in scope)
-let sectors_per_batch = batch_size_sectors as u64;
+                // How many sectors make up one batch (already in scope)
+                let sectors_per_batch = batch_size_sectors as u64;
 
-// 0-based batch number in THIS test run
-let batch_index = (msg.abs_start_sector - resume_from_sector) / sectors_per_batch;
+                // 0-based batch number in THIS test run
+                let _batch_index =
+                    (msg.abs_start_sector - resume_from_sector) / sectors_per_batch;
 
-// Alternate every batch when --dual-pattern is set
-let pattern_label = if dual_pattern && batch_index % 2 == 0 {
-    "random"
-} else {
-    base_label
-};
+                // When --dual-pattern is active, each batch contains both patterns
+                let pattern_label = if dual_pattern { "dual" } else { base_label };
 
-log_simple(
-    &log_f_opt,
-    Some(&pb_arc),
-    format!(
-        "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: \
-         {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
-        pattern_label,
-        write_mib,
-        read_mib,
-    ),
-);
+                if dual_pattern {
+                    log_simple(
+                        &log_f_opt,
+                        Some(&pb_arc),
+                        format!(
+                            "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {} {:.0} MiB/sec … {:.0} MiB/sec | random {:.0} MiB/sec … {:.0} MiB/sec",
+                            pattern_label,
+                            base_label,
+                            write_mib_first,
+                            read_mib_first,
+                            write_mib_second,
+                            read_mib_second,
+                        ),
+                    );
+                } else {
+                    log_simple(
+                        &log_f_opt,
+                        Some(&pb_arc),
+                        format!(
+                            "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
+                            pattern_label,
+                            write_mib_first,
+                            read_mib_first,
+                        ),
+                    );
+                }
 
                 if let Some(e) = msg.io_error {
                     counters_arc.increment_write_errors();
