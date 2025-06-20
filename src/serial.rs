@@ -60,7 +60,8 @@ mod linux {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use std::{ffi::c_void, mem, os::windows::prelude::*, ptr};
+    use std::{mem, os::windows::prelude::*, ptr};
+    use winapi::ctypes::c_void;
     use winapi::um::{
         fileapi::CreateFileW,
         winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED},
