@@ -724,6 +724,34 @@ mod tests {
 
         single_sector_read(&log, path, 0, 16, false).unwrap();
     }
+
+    #[test]
+    fn test_dual_pattern_split_in_batch() {
+        let block_size = 8;
+        let sectors = 4;
+        let pattern = DataTypePattern::Binary;
+        let mut buf = vec![0u8; block_size * sectors];
+        let mut tile = vec![0u8; block_size];
+        let split = sectors / 2;
+        for i in 0..sectors {
+            let abs = i as u64;
+            if i < split {
+                pattern.fill_block_inplace(&mut tile, abs);
+            } else {
+                DataTypePattern::Random.fill_block_inplace(&mut tile, abs);
+            }
+            let start = i * block_size;
+            buf[start..start + block_size].copy_from_slice(&tile);
+        }
+
+        let mut expected_first = vec![0u8; block_size];
+        pattern.fill_block_inplace(&mut expected_first, 0);
+        assert_eq!(&buf[0..block_size], &expected_first);
+
+        let mut expected_second = vec![0u8; block_size];
+        pattern.fill_block_inplace(&mut expected_second, split as u64);
+        assert_ne!(&buf[split * block_size..(split + 1) * block_size], &expected_second);
+    }
 }
 
 fn single_sector_write(
@@ -1557,13 +1585,21 @@ fn full_reliability_test(
 
                     // Generate pattern for the whole batch at once
                     let mut pattern_tile = alloc_buffer(block_size_usize, false);
+                    let split_point = this_batch_sectors / 2;
                     for i in 0..this_batch_sectors {
                         let current_abs_sector = abs_first_sector + i as u64;
-                        if dual_pattern && current_abs_sector % 2 == 0 {
-                            DataTypePattern::Random.fill_block_inplace(
-                                &mut pattern_tile,
-                                current_abs_sector,
-                            );
+                        if dual_pattern {
+                            if i < split_point {
+                                data_pattern_arc.fill_block_inplace(
+                                    &mut pattern_tile,
+                                    current_abs_sector,
+                                );
+                            } else {
+                                DataTypePattern::Random.fill_block_inplace(
+                                    &mut pattern_tile,
+                                    current_abs_sector,
+                                );
+                            }
                         } else {
                             data_pattern_arc.fill_block_inplace(
                                 &mut pattern_tile,
@@ -1647,11 +1683,11 @@ let base_label = match &*data_pattern_arc {
 let sectors_per_batch = batch_size_sectors as u64;
 
 // 0-based batch number in THIS test run
-let batch_index = (msg.abs_start_sector - resume_from_sector) / sectors_per_batch;
+let _batch_index = (msg.abs_start_sector - resume_from_sector) / sectors_per_batch;
 
-// Alternate every batch when --dual-pattern is set
-let pattern_label = if dual_pattern && batch_index % 2 == 0 {
-    "random"
+// When --dual-pattern is active, each batch contains both patterns
+let pattern_label = if dual_pattern {
+    "dual"
 } else {
     base_label
 };
