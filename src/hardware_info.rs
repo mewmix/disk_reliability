@@ -172,67 +172,24 @@ pub fn get_usb_controller_info_macos(_disk_path: &str) -> io::Result<String> {
 }
 
 #[cfg(target_os = "windows")]
-#[repr(C)]
-struct STORAGE_PROPERTY_QUERY {
-    PropertyId: u32,
-    QueryType: u32,
-    AdditionalParameters: [u8; 1],
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-struct STORAGE_DEVICE_DESCRIPTOR {
-    Version: u32,
-    Size: u32,
-    DeviceType: u8,
-    DeviceTypeModifier: u8,
-    RemovableMedia: u8,
-    CommandQueueing: u8,
-    VendorIdOffset: u32,
-    ProductIdOffset: u32,
-    ProductRevisionOffset: u32,
-    SerialNumberOffset: u32,
-    BusType: u8,
-    RawPropertiesLength: u32,
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-struct STORAGE_SEEK_PENALTY_DESCRIPTOR {
-    Version: u32,
-    Size: u32,
-    IncursSeekPenalty: winapi::shared::minwindef::BOOLEAN,
-}
-
-#[cfg(target_os = "windows")]
-const BUS_TYPE_USB: u8 = 7;
-#[cfg(target_os = "windows")]
-const BUS_TYPE_NVME: u8 = 17;
-#[cfg(target_os = "windows")]
-const BUS_TYPE_SATA: u8 = 11;
-#[cfg(target_os = "windows")]
-const BUS_TYPE_ATA: u8 = 3;
-#[cfg(target_os = "windows")]
-const BUS_TYPE_SD: u8 = 12;
-#[cfg(target_os = "windows")]
-const BUS_TYPE_MMC: u8 = 13;
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        BusTypeAta, BusTypeMmc, BusTypeNvme, BusTypeSata, BusTypeSd, BusTypeUsb,
+    },
+    System::IO::DeviceIoControl,
+    System::Ioctl::{
+        IOCTL_STORAGE_QUERY_PROPERTY, DEVICE_SEEK_PENALTY_DESCRIPTOR,
+        STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+        StorageDeviceSeekPenaltyProperty, PropertyStandardQuery,
+    },
+};
 
 #[cfg(target_os = "windows")]
 pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
     use std::{mem, os::windows::prelude::*, ptr};
-    use winapi::ctypes::c_void;
-    use winapi::um::{
-        fileapi::CreateFileW,
-        handleapi::CloseHandle,
-        winbase::FILE_FLAG_BACKUP_SEMANTICS,
-        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE},
-        ioapiset::DeviceIoControl,
-    };
-
-    const PropertyStandardQuery: u32 = 0;
-    const StorageDeviceProperty: u32 = 0;
-    const StorageDeviceSeekPenaltyProperty: u32 = 7;
-    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1400;
+    use core::ffi::c_void;
 
     let mut dev_path = format!(r"\\.\{}", drive.trim_end_matches(':'));
     if !dev_path.ends_with(':') {
@@ -251,9 +208,9 @@ pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
             ptr::null_mut(),
             3,
             FILE_FLAG_BACKUP_SEMANTICS,
-            ptr::null_mut(),
+            0,
         );
-        if h.is_null() {
+        if h == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
 
@@ -281,11 +238,11 @@ pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
         }
         let desc: &STORAGE_DEVICE_DESCRIPTOR = &*(buf.as_ptr() as *const _);
         let bus = match desc.BusType {
-            BUS_TYPE_USB => "USB",
-            BUS_TYPE_NVME => "NVMe",
-            x if x == BUS_TYPE_SATA || x == BUS_TYPE_ATA => "SATA",
-            BUS_TYPE_SD => "SD-card",
-            BUS_TYPE_MMC => "eMMC",
+            BusTypeUsb => "USB",
+            BusTypeNvme => "NVMe",
+            x if x == BusTypeSata || x == BusTypeAta => "SATA",
+            BusTypeSd => "SD-card",
+            BusTypeMmc => "eMMC",
             _ => "Other/Unknown",
         };
 
@@ -294,14 +251,14 @@ pub fn classify_media_windows(drive: &str) -> io::Result<(String, String)> {
             QueryType: PropertyStandardQuery,
             AdditionalParameters: [0],
         };
-        let mut seek_desc: STORAGE_SEEK_PENALTY_DESCRIPTOR = mem::zeroed();
+        let mut seek_desc: DEVICE_SEEK_PENALTY_DESCRIPTOR = mem::zeroed();
         let ok2 = DeviceIoControl(
             h,
             IOCTL_STORAGE_QUERY_PROPERTY,
             &query_seek as *const _ as *mut c_void,
             mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
             &mut seek_desc as *mut _ as *mut c_void,
-            mem::size_of::<STORAGE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
             &mut out,
             ptr::null_mut(),
         );

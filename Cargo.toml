@@ -19,6 +19,12 @@ rand = "0.8"
 cfg-if = "1.0"
 thiserror = "2"
 winapi = { version = "0.3.9", features = [
+windows-sys = { version = "0.52", features = [
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
     "fileapi",
     "handleapi",
     "ioapiset",

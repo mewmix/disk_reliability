@@ -61,45 +61,23 @@ mod linux {
 mod windows {
     use super::*;
     use std::{mem, os::windows::prelude::*, ptr};
-    use winapi::ctypes::c_void;
-    use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
-    use winapi::um::winioctl::{
-    IOCTL_STORAGE_GET_DEVICE_NUMBER,
-    STORAGE_DEVICE_NUMBER,
-    IOCTL_STORAGE_QUERY_PROPERTY,
-};
-    
-    use winapi::um::{
-        fileapi::CreateFileW,
-        handleapi::CloseHandle,
-        winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED},
-        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, HANDLE},
-        ioapiset::DeviceIoControl,
-    };
-
-    #[repr(C)]
-    struct STORAGE_PROPERTY_QUERY {
-        property_id: u32,
-        query_type: u32,
-        additional: [u8; 1],
-    }
-    const StorageDeviceProperty: u32 = 0;
-    const PropertyStandardQuery: u32 = 0;
-
-    unsafe fn physical_drive_from_letter(handle: HANDLE) -> io::Result<String> {
-        let mut dev_num: STORAGE_DEVICE_NUMBER = mem::zeroed();
-        let mut bytes = 0u32;
-        let ok = DeviceIoControl(
-            handle,
-            IOCTL_STORAGE_GET_DEVICE_NUMBER,
-            ptr::null_mut(),
-            0,
-            &mut dev_num as *mut _ as *mut _,
-            mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
-            &mut bytes,
-            ptr::null_mut(),
-        );
-        if ok == 0 {
+    use core::ffi::c_void;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        },
+        System::IO::DeviceIoControl,
+        System::Ioctl::{
+            IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER,
+            IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY, STORAGE_DEVICE_DESCRIPTOR,
+            StorageDeviceProperty, PropertyStandardQuery,
+        },
+            if handle == INVALID_HANDLE_VALUE {
+                PropertyId: StorageDeviceProperty,
+                QueryType: PropertyStandardQuery,
+                AdditionalParameters: [0],
+            if h == INVALID_HANDLE_VALUE {
             Err(io::Error::last_os_error())
         } else {
             Ok(format!(r"\\.\PhysicalDrive{}", dev_num.DeviceNumber))
