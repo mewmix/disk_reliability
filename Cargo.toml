@@ -27,6 +27,8 @@ winapi = { version = "0.3.9", features = [
     "winnt",        # For HANDLE, ULARGE_INTEGER (definition), also where FileAllocationInfo enum member is defined for FILE_INFO_BY_HANDLE_CLASS
     "ioapiset",     # For DeviceIoControl
     "winerror",     # For ERROR_INSUFFICIENT_BUFFER constant
+    "handleapi",    # For CloseHandle
+    "winioctl",     # For IOCTL_STORAGE_GET_DEVICE_NUMBER
 ]}
 
 [target.'cfg(target_os = "linux")'.dependencies]
