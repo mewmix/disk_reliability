@@ -42,9 +42,7 @@ pub fn usb_storage_report(path: &str) -> io::Result<String> {
         .and_then(|n| n.get("_items"))
         .and_then(|n| n.as_array())
         .and_then(|arr| arr.last())
-        .ok_or_else(|| {
-            io::Error::new(ErrorKind::Other, "Unexpected system_profiler output")
-        })?;
+        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
 
     let mut stack = Vec::new();
     let path_nodes = search(root, &bsd, &mut stack)

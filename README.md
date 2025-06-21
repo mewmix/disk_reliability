@@ -125,7 +125,8 @@ Errors (read/write mismatch, seek failure, etc.) are printed in‑line and appen
 ## 7  Known Limitations / TODO
 
 * No sparse‑file awareness: pre‑allocation equals full allocation on NTFS.
-* Direct‑I/O unsupported on macOS (Apple blocks it); build succeeds but the flag is ignored.
+* macOS uses F_NOCACHE + F_RDAHEAD rather than true O_DIRECT.  It still
+  bypasses the cache but may copy data one extra time in the kernel.
 * SMB/NFS mounts may reject `O_DIRECT`/`FILE_FLAG_NO_BUFFERING`.
 * No native checksum/hashing yet – mismatches are byte‑for‑byte.
 
