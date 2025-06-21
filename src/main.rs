@@ -2231,31 +2231,26 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     format!("Block Size: {} bytes", bsize),
                 );
             }
-            if let Ok(usb) = hardware_info::get_usb_controller_info_macos(path_str) {
-                log_simple(&log_file_arc_opt, None, usb);
-            } else {
-                log_simple(
+            match mac_usb_report::usb_storage_summary(path_str) {
+                Ok(s) => log_simple(&log_file_arc_opt, None, s),
+                Err(_) => log_simple(
                     &log_file_arc_opt,
                     None,
                     "USB controller information unavailable.",
-                );
+                ),
             }
             match hardware_info::get_usb_serial_numbers() {
                 Ok(serials) => log_simple(&log_file_arc_opt, None, serials),
                 Err(_) => log_simple(&log_file_arc_opt, None, "No USB disk serial numbers found."),
             }
-            if let Ok(tree) = mac_usb_report::usb_storage_report(path_str) {
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
-                    format!("USB / Controller Tree (incl. power) \u{2193}\n{tree}"),
-                );
-            } else {
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
-                    "USB / Controller Tree: not found or error.",
-                );
+            if cli.verbose {
+                if let Ok(tree) = mac_usb_report::usb_storage_report(path_str) {
+                    log_simple(
+                        &log_file_arc_opt,
+                        None,
+                        format!("USB / Controller Tree (incl. power) \u{2193}\n{tree}"),
+                    );
+                }
             }
         }
         #[cfg(target_os = "linux")]
