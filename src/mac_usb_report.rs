@@ -20,13 +20,12 @@ pub fn usb_storage_report(path: &str) -> io::Result<String> {
 
     let json: JsonValue = serde_json::from_slice(&output.stdout)
         .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-    let items = json
+    let root = json
         .get("SPUSBDataType")
-        .and_then(|v| v.as_array())
         .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
 
     let mut stack = Vec::new();
-    let path_nodes = search(items, &bsd, &mut stack)
+    let path_nodes = search(root, &bsd, &mut stack)
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "USB path not found"))?;
 
     let mut out = String::new();
