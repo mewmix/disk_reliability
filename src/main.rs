@@ -532,7 +532,7 @@ fn open_file_options(
     write: bool,
     create: bool,
     direct_io: bool,
-    log_f: &Option<Arc<Mutex<File>>>,
+    _log_f: &Option<Arc<Mutex<File>>>,
 ) -> OpenOptions {
     let mut opts = OpenOptions::new();
     if read {
@@ -551,7 +551,7 @@ fn open_file_options(
             #[cfg(target_os = "linux")]
             {
                 log_simple(
-                    log_f,
+                    _log_f,
                     None,
                     "Using O_DIRECT on Linux. Ensure buffer/IO alignment and block size multiple of 512B.",
                 );
@@ -560,7 +560,7 @@ fn open_file_options(
             #[cfg(target_os = "windows")]
             {
                 log_simple(
-                    log_f,
+                    _log_f,
                     None,
                     "Using FILE_FLAG_NO_BUFFERING on Windows. Ensure sector alignment and block size multiple of 512B.",
                 );
@@ -569,7 +569,7 @@ fn open_file_options(
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 log_simple(
-                    log_f,
+                    _log_f,
                     None,
                     "Direct I/O requested but not supported on this platform. Ignored.",
                 );
@@ -580,7 +580,7 @@ fn open_file_options(
             // Suppress unused variable warning if direct_io is always false
             let _ = direct_io;
             log_simple(
-                log_f,
+                _log_f,
                 None,
                 "Direct I/O not enabled in this build. Using standard buffered I/O.",
             );

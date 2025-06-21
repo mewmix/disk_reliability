@@ -38,7 +38,13 @@ pub fn usb_storage_report(path: &str) -> io::Result<String> {
     let json = system_profiler_json()?;
     let root = json
         .get("SPUSBDataType")
-        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
+        .and_then(|n| n.get(0))
+        .and_then(|n| n.get("_items"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| arr.last())
+        .ok_or_else(|| {
+            io::Error::new(ErrorKind::Other, "Unexpected system_profiler output")
+        })?;
 
     let mut stack = Vec::new();
     let path_nodes = search(root, &bsd, &mut stack)
@@ -64,6 +70,10 @@ pub fn usb_storage_summary(path: &str) -> io::Result<String> {
     let json = system_profiler_json()?;
     let root = json
         .get("SPUSBDataType")
+        .and_then(|n| n.get(0))
+        .and_then(|n| n.get("_items"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| arr.last())
         .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
 
     // Re-use the existing search() helper to fetch the node chain.
