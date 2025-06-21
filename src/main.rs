@@ -49,10 +49,6 @@ use winapi::um::{
     winnt::{HANDLE, ULARGE_INTEGER}, // ULARGE_INTEGER is used by GetDiskFreeSpaceExW
 };
 
-#[cfg(all(target_family = "unix", not(target_os = "linux")))]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 

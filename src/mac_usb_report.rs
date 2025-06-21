@@ -35,7 +35,8 @@ pub fn usb_storage_report(path: &str) -> io::Result<String> {
         io::Error::new(ErrorKind::NotFound, "Could not resolve BSD name for path")
     })?;
 
-    let root = system_profiler_json()?
+    let json = system_profiler_json()?;
+    let root = json
         .get("SPUSBDataType")
         .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
 
@@ -60,7 +61,8 @@ pub fn usb_storage_summary(path: &str) -> io::Result<String> {
         io::Error::new(ErrorKind::NotFound, "Could not resolve BSD name for path")
     })?;
 
-    let root = system_profiler_json()?
+    let json = system_profiler_json()?;
+    let root = json
         .get("SPUSBDataType")
         .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
 
@@ -70,10 +72,7 @@ pub fn usb_storage_summary(path: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "USB path not found"))?;
 
     // Last entry is the actual storage device; its parent is the hub/port.
-    let dev = path_nodes
-        .last()
-        .and_then(|n| n.as_object())
-        .unwrap_or_default();
+    let dev = path_nodes.last().and_then(|n| n.as_object());
     let hub = if path_nodes.len() >= 2 {
         path_nodes[path_nodes.len() - 2].as_object()
     } else {
@@ -81,19 +80,16 @@ pub fn usb_storage_summary(path: &str) -> io::Result<String> {
     };
 
     let dev_name = dev
-        .get("_name")
-        .and_then(|v| v.as_str())
+        .and_then(|d| d.get("_name").and_then(|v| v.as_str()))
         .unwrap_or("USB Device");
     let mfr = dev
-        .get("manufacturer")
-        .and_then(|v| v.as_str())
+        .and_then(|d| d.get("manufacturer").and_then(|v| v.as_str()))
         .unwrap_or("");
     let speed = hub
         .and_then(|h| h.get("speed").and_then(|v| v.as_str()))
         .unwrap_or("");
     let req_ma = dev
-        .get("current_required")
-        .and_then(|v| v.as_u64())
+        .and_then(|d| d.get("current_required").and_then(|v| v.as_u64()))
         .unwrap_or(0);
     let avail_ma = hub
         .and_then(|h| h.get("current_available").and_then(|v| v.as_u64()))
