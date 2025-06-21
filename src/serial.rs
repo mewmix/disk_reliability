@@ -245,12 +245,11 @@ mod macos {
     };
     use io_kit_sys::{
         ret::{kIOReturnNotFound, IOReturn},
-        types::{
-            io_registry_entry_t, io_service_t, kIOMasterPortDefault, mach_port_t, IO_OBJECT_NULL,
-        },
+        types::{io_registry_entry_t, io_service_t, IO_OBJECT_NULL},
         IOBSDNameMatching, IOObjectRelease, IORegistryEntryCreateCFProperty,
-        IOServiceGetMatchingService,
+        IOServiceGetMatchingService, kIOMasterPortDefault,
     };
+    use mach2::port::mach_port_t;
 
     extern "C" {
         fn IORegistryEntryFromPath(
@@ -260,7 +259,9 @@ mod macos {
     }
 
     /// Safe-ish helper that replaces the missing `registry_entry_from_path`
-    unsafe fn registry_entry_from_path(path: &str) -> Result<io_registry_entry_t, IOReturn> {
+    unsafe fn registry_entry_from_path(
+        path: &str,
+    ) -> std::result::Result<io_registry_entry_t, IOReturn> {
         let c_path = CString::new(path).unwrap();
         let entry = IORegistryEntryFromPath(kIOMasterPortDefault, c_path.as_ptr());
         if entry == IO_OBJECT_NULL {
