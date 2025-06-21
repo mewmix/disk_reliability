@@ -18,6 +18,8 @@ rusb = "0.9"
 rand = "0.8"
 cfg-if = "1.0"
 thiserror = "2"
+plist = "1.7"
+serde_json = "1.0"
 winapi = { version = "0.3.9", features = [
     "fileapi",
     "handleapi",
