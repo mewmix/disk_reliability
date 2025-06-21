@@ -31,7 +31,7 @@ pub fn disk_serial<P: AsRef<Path>>(dev: P) -> Result<String> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use udev::{Enumerator, Device};
+    use udev::{Device, Enumerator};
 
     pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
         let dev = dev.as_ref().canonicalize()?;
@@ -64,17 +64,15 @@ mod windows {
     use winapi::ctypes::c_void;
     use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
     use winapi::um::winioctl::{
-    IOCTL_STORAGE_GET_DEVICE_NUMBER,
-    STORAGE_DEVICE_NUMBER,
-    IOCTL_STORAGE_QUERY_PROPERTY,
-};
-    
+        IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DEVICE_NUMBER,
+    };
+
     use winapi::um::{
         fileapi::CreateFileW,
         handleapi::CloseHandle,
+        ioapiset::DeviceIoControl,
         winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED},
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, HANDLE},
-        ioapiset::DeviceIoControl,
     };
 
     #[repr(C)]
@@ -158,7 +156,9 @@ mod windows {
                 } else {
                     let offset = desc.serial_number_offset as usize;
                     let nul = buf[offset..].iter().position(|&b| b == 0).unwrap_or(0);
-                    let s = String::from_utf8_lossy(&buf[offset..offset + nul]).trim().to_owned();
+                    let s = String::from_utf8_lossy(&buf[offset..offset + nul])
+                        .trim()
+                        .to_owned();
                     if s.is_empty() {
                         Err(SerialError::NotFound)
                     } else {
@@ -192,8 +192,9 @@ mod windows {
         // -------- drive-letter (D:, D:\, D:/) →  \\.\D: -------------------
         let s = dev.as_ref().display().to_string();
         let (mut device_path, is_letter) = match s.chars().next() {
-            Some(c) if c.is_ascii_alphabetic()
-                && (s.len() == 2 || s.starts_with(":\\") || s.starts_with(":/")) =>
+            Some(c)
+                if c.is_ascii_alphabetic()
+                    && (s.len() == 2 || s.starts_with(":\\") || s.starts_with(":/")) =>
             {
                 (format!(r"\\.\{}:", c.to_ascii_uppercase()), true)
             }
@@ -233,31 +234,107 @@ mod windows {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use ioreg::{self, IOReturn};
+    use std::ffi::{CStr, CString};
+
+    use core_foundation_sys::{
+        base::{kCFAllocatorDefault, CFGetTypeID, CFRelease, CFTypeRef},
+        string::{
+            kCFStringEncodingUTF8, CFStringCreateWithCString, CFStringGetCString,
+            CFStringGetTypeID, CFStringRef,
+        },
+    };
+    use io_kit_sys::{
+        ret::{kIOReturnNotFound, IOReturn},
+        types::{io_registry_entry_t, io_service_t, IO_OBJECT_NULL},
+        IOBSDNameMatching, IOObjectRelease, IORegistryEntryCreateCFProperty,
+        IOServiceGetMatchingService,
+    };
+    use mach2::port::mach_port_t;
+
+    extern "C" {
+        fn IORegistryEntryFromPath(
+            master_port: mach_port_t,
+            path: *const libc::c_char,
+        ) -> io_registry_entry_t;
+    }
+
+    const K_IOMASTER_PORT_DEFAULT: mach_port_t = 0;
+
+    /// Safe-ish helper that replaces the missing `registry_entry_from_path`
+    unsafe fn registry_entry_from_path(
+        path: &str,
+    ) -> std::result::Result<io_registry_entry_t, IOReturn> {
+        let c_path = CString::new(path).unwrap();
+        let entry = IORegistryEntryFromPath(K_IOMASTER_PORT_DEFAULT, c_path.as_ptr());
+        if entry == IO_OBJECT_NULL {
+            Err(kIOReturnNotFound)
+        } else {
+            Ok(entry)
+        }
+    }
 
     pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
-        // Match IOMedia objects with BSD Name == disk* and fetch "Serial Number"
         let bsd = dev
             .as_ref()
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or(SerialError::Other)?;
 
-        let root = ioreg::registry_entry_from_path("IOService:/")?;
-        for media in root
-            .iterate("IOMedia")
-            .map_err(|_| SerialError::Other)?
-        {
-            let name: String = media.property("BSD Name").unwrap_or_default();
-            if name == bsd {
-                let sn: String = media.property("Serial Number").unwrap_or_default();
-                return if sn.is_empty() {
-                    Err(SerialError::NotFound)
-                } else {
-                    Ok(sn)
-                };
+        unsafe {
+            let bsd_c = CString::new(bsd).unwrap();
+            let matching = IOBSDNameMatching(K_IOMASTER_PORT_DEFAULT, 0, bsd_c.as_ptr());
+            if matching.is_null() {
+                return Err(SerialError::Other);
+            }
+
+            let service: io_service_t =
+                IOServiceGetMatchingService(K_IOMASTER_PORT_DEFAULT, matching);
+            if service == IO_OBJECT_NULL {
+                return Err(SerialError::NotFound);
+            }
+
+            let key_c = CString::new("Serial Number").unwrap();
+            let key = CFStringCreateWithCString(
+                kCFAllocatorDefault,
+                key_c.as_ptr(),
+                kCFStringEncodingUTF8,
+            );
+            if key.is_null() {
+                IOObjectRelease(service);
+                return Err(SerialError::Other);
+            }
+
+            let value = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0);
+            CFRelease(key as CFTypeRef);
+            IOObjectRelease(service);
+            if value.is_null() {
+                return Err(SerialError::NotFound);
+            }
+
+            if CFGetTypeID(value) != CFStringGetTypeID() {
+                CFRelease(value);
+                return Err(SerialError::Other);
+            }
+
+            let cf_str: CFStringRef = value as CFStringRef;
+            let mut buf = vec![0i8; 256];
+            let ok = CFStringGetCString(
+                cf_str,
+                buf.as_mut_ptr(),
+                buf.len() as _,
+                kCFStringEncodingUTF8,
+            );
+            CFRelease(value);
+            if ok == 0 {
+                return Err(SerialError::Other);
+            }
+            let cstr = CStr::from_ptr(buf.as_ptr());
+            let serial = cstr.to_string_lossy().into_owned();
+            if serial.is_empty() {
+                Err(SerialError::NotFound)
+            } else {
+                Ok(serial)
             }
         }
-        Err(SerialError::NotFound)
     }
 }
