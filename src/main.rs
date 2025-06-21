@@ -28,6 +28,8 @@ use rand::{thread_rng, Rng};
 mod hardware_info;
 #[cfg(target_os = "macos")]
 mod mac_usb_report;
+#[cfg(all(target_os = "macos", feature = "direct"))]
+mod macos_direct;
 mod serial;
 
 // Platform-specific imports
@@ -590,6 +592,41 @@ fn open_file_options(
     opts
 }
 
+/// Wrapper around `open_file_options().open()` that, on macOS+direct,
+/// activates F_NOCACHE / F_RDAHEAD once the FD is live.
+fn open_file<P: AsRef<Path>>(
+    path: P,
+    read: bool,
+    write: bool,
+    create: bool,
+    direct_io: bool,
+    log_f: &Option<Arc<Mutex<File>>>,
+) -> io::Result<File> {
+    let file =
+        open_file_options(path.as_ref(), read, write, create, direct_io, log_f).open(&path)?;
+
+    #[cfg(all(target_os = "macos", feature = "direct"))]
+    {
+        if direct_io {
+            match macos_direct::enable_nocache(&file) {
+                Ok(_) => log_simple(
+                    log_f,
+                    None,
+                    "F_NOCACHE active – I/O is now uncached on macOS.",
+                ),
+                Err(e) => log_simple(
+                    log_f,
+                    None,
+                    format!(
+                        "\u{26a0}\u{fe0f}  Unable to set F_NOCACHE: {e} (falling back to buffered I/O)"
+                    ),
+                ),
+            }
+        }
+    }
+    Ok(file)
+}
+
 /// Allocates an `AlignedVec` of `len` zero-filled bytes.
 #[inline]
 fn alloc_buffer(len: usize, direct: bool) -> AlignedVec<u8> {
@@ -622,8 +659,7 @@ fn single_sector_read(
         None,
         format!("Initiating Single-Sector Read @ sector {}", sector),
     );
-    let mut file =
-        open_file_options(file_path, true, false, false, direct_io, log_f).open(file_path)?;
+    let mut file = open_file(file_path, true, false, false, direct_io, log_f)?;
     let offset = sector.saturating_mul(block_size as u64);
 
     // Check if file is large enough before seeking & reading
@@ -808,8 +844,7 @@ fn single_sector_write(
         None,
         format!("Initiating Single-Sector Write @ sector {}", sector),
     );
-    let mut file =
-        open_file_options(file_path, false, true, true, direct_io, log_f).open(file_path)?;
+    let mut file = open_file(file_path, false, true, true, direct_io, log_f)?;
 
     let offset = sector.saturating_mul(block_size as u64);
     let required_len_for_write = offset.saturating_add(block_size as u64);
@@ -867,8 +902,7 @@ fn range_read(
     direct_io: bool,
     verbose: bool,
 ) -> io::Result<()> {
-    let mut file =
-        open_file_options(file_path, true, false, false, direct_io, log_f).open(file_path)?;
+    let mut file = open_file(file_path, true, false, false, direct_io, log_f)?;
     let file_len_bytes = file.metadata()?.len();
     let file_len_sectors = if block_size > 0 {
         file_len_bytes / block_size as u64
@@ -994,8 +1028,7 @@ fn range_write(
             start_sector, end_sector
         ),
     );
-    let mut file =
-        open_file_options(file_path, true, true, true, direct_io, log_f).open(file_path)?;
+    let mut file = open_file(file_path, true, true, true, direct_io, log_f)?;
 
     let required_len_for_write = end_sector.saturating_mul(block_size as u64);
     let current_len = file.metadata()?.len();
@@ -1051,8 +1084,7 @@ fn range_verify(
     data_pattern: &DataTypePattern,
     direct_io: bool,
 ) -> io::Result<()> {
-    let mut file =
-        open_file_options(file_path, true, false, false, direct_io, log_f).open(file_path)?;
+    let mut file = open_file(file_path, true, false, false, direct_io, log_f)?;
     let file_len_bytes = file.metadata()?.len();
     let file_len_sectors = if block_size > 0 {
         file_len_bytes / block_size as u64
@@ -1474,8 +1506,7 @@ fn full_reliability_test(
         ),
     );
 
-    let file_for_setup =
-        open_file_options(file_path, true, true, true, false, log_f_opt).open(file_path)?;
+    let file_for_setup = open_file(file_path, true, true, true, false, log_f_opt)?;
     if preallocate {
         preallocate_file(&file_for_setup, required_total_file_size, log_f_opt)?;
     } else {
@@ -1557,27 +1588,19 @@ fn full_reliability_test(
 
         let worker = thread::spawn(move || {
             // Open once – sequential access, O_DIRECT optionally.
-            let mut f = match open_file_options(
-                &worker_file_path,
-                true,
-                true,
-                false,
-                direct_io,
-                &worker_log,
-            )
-            .open(&worker_file_path)
-            {
-                Ok(fd) => fd,
-                Err(e) => {
-                    log_simple(
-                        &worker_log,
-                        Some(&worker_pb_arc),
-                        format!("Worker thread cannot open test file: {}", e),
-                    );
-                    HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
-                    return;
-                }
-            };
+            let mut f =
+                match open_file(&worker_file_path, true, true, false, direct_io, &worker_log) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        log_simple(
+                            &worker_log,
+                            Some(&worker_pb_arc),
+                            format!("Worker thread cannot open test file: {}", e),
+                        );
+                        HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                };
 
             // This worker thread owns the read buffer.
             // It's sized to the max batch size and reused for every read.
