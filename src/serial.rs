@@ -10,10 +10,10 @@ pub enum SerialError {
     Other,
 }
 
-pub type Result<T> = std::result::Result<T, SerialError>;
+pub type SerialResult<T> = std::result::Result<T, SerialError>;
 
 /// Unified entry point.
-pub fn disk_serial<P: AsRef<Path>>(dev: P) -> Result<String> {
+pub fn disk_serial<P: AsRef<Path>>(dev: P) -> SerialResult<String> {
     cfg_if::cfg_if! {
         if #[cfg(target_os = "linux")] {
             linux::serial(dev)
@@ -33,7 +33,7 @@ mod linux {
     use super::*;
     use udev::{Device, Enumerator};
 
-    pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
+    pub fn serial<P: AsRef<Path>>(dev: P) -> SerialResult<String> {
         let dev = dev.as_ref().canonicalize()?;
         // Map /dev/whatever to its sysfs device and read SERIAL property.
         let mut en = Enumerator::new()?;
@@ -48,7 +48,7 @@ mod linux {
         Err(SerialError::NotFound)
     }
 
-    fn prop(d: &Device) -> Result<String> {
+    fn prop(d: &Device) -> SerialResult<String> {
         d.property_value("ID_SERIAL_SHORT")
             .or_else(|| d.property_value("ID_SERIAL"))
             .map(|v| v.to_string_lossy().into_owned())
@@ -104,7 +104,7 @@ mod windows {
         }
     }
 
-    fn query_serial(device_path: &str) -> Result<String> {
+    fn query_serial(device_path: &str) -> SerialResult<String> {
         let wide: Vec<u16> = std::ffi::OsStr::new(device_path)
             .encode_wide()
             .chain(Some(0))
@@ -188,7 +188,7 @@ mod windows {
         // followed by raw data
     }
 
-    pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
+    pub fn serial<P: AsRef<Path>>(dev: P) -> SerialResult<String> {
         // -------- drive-letter (D:, D:\, D:/) →  \\.\D: -------------------
         let s = dev.as_ref().display().to_string();
         let (mut device_path, is_letter) = match s.chars().next() {
@@ -243,8 +243,9 @@ mod macos {
             CFStringGetTypeID, CFStringRef,
         },
     };
+    use io_kit_sys::ffi::kIOMasterPortDefault;
     use io_kit_sys::{
-        ret::{kIOReturnNotFound, IOReturn},
+        ret::kIOReturnNotFound,
         types::{io_registry_entry_t, io_service_t, IO_OBJECT_NULL},
         IOBSDNameMatching, IOObjectRelease, IORegistryEntryCreateCFProperty,
         IOServiceGetMatchingService,
@@ -258,22 +259,20 @@ mod macos {
         ) -> io_registry_entry_t;
     }
 
-    const K_IOMASTER_PORT_DEFAULT: mach_port_t = 0;
-
     /// Safe-ish helper that replaces the missing `registry_entry_from_path`
     unsafe fn registry_entry_from_path(
         path: &str,
-    ) -> std::result::Result<io_registry_entry_t, IOReturn> {
+    ) -> std::result::Result<io_registry_entry_t, i32> {
         let c_path = CString::new(path).unwrap();
-        let entry = IORegistryEntryFromPath(K_IOMASTER_PORT_DEFAULT, c_path.as_ptr());
+        let entry = IORegistryEntryFromPath(kIOMasterPortDefault, c_path.as_ptr());
         if entry == IO_OBJECT_NULL {
-            Err(kIOReturnNotFound)
+            Err(kIOReturnNotFound) // propagate raw code
         } else {
             Ok(entry)
         }
     }
 
-    pub fn serial<P: AsRef<Path>>(dev: P) -> Result<String> {
+    pub fn serial<P: AsRef<Path>>(dev: P) -> SerialResult<String> {
         let bsd = dev
             .as_ref()
             .file_name()
@@ -282,13 +281,12 @@ mod macos {
 
         unsafe {
             let bsd_c = CString::new(bsd).unwrap();
-            let matching = IOBSDNameMatching(K_IOMASTER_PORT_DEFAULT, 0, bsd_c.as_ptr());
+            let matching = IOBSDNameMatching(kIOMasterPortDefault, 0, bsd_c.as_ptr());
             if matching.is_null() {
                 return Err(SerialError::Other);
             }
 
-            let service: io_service_t =
-                IOServiceGetMatchingService(K_IOMASTER_PORT_DEFAULT, matching);
+            let service: io_service_t = IOServiceGetMatchingService(kIOMasterPortDefault, matching);
             if service == IO_OBJECT_NULL {
                 return Err(SerialError::NotFound);
             }
