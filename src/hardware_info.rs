@@ -1,14 +1,15 @@
-use sysinfo::Disks;
+#[cfg(target_os = "windows")]
+use std::collections::HashMap;
 use std::io;
 use std::process::Command;
-use std::collections::HashMap;
 use std::time::Duration;
+use sysinfo::Disks;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
 /// Retrieves information about the disk at the given path.
 pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
-    let mut disks = Disks::new_with_refreshed_list();
+    let disks = Disks::new_with_refreshed_list();
     for disk in disks.list() {
         let mount_point_cow = disk.mount_point().to_string_lossy();
         let mount_point_str = mount_point_cow.as_ref();
@@ -46,7 +47,10 @@ pub fn get_block_size_windows(disk_path: &str) -> io::Result<u64> {
         }
     }
 
-    Err(io::Error::new(io::ErrorKind::NotFound, "Block size not found"))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Block size not found",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -66,7 +70,10 @@ pub fn get_block_size_macos(disk_path: &str) -> io::Result<u64> {
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, "Block size not found"))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Block size not found",
+    ))
 }
 
 /// Retrieves USB controller and vendor info for the disk on Windows.
@@ -104,7 +111,10 @@ pub fn get_usb_controller_info_windows(disk_path: &str) -> io::Result<String> {
         }
     }
 
-    Err(io::Error::new(io::ErrorKind::NotFound, "USB Controller not found"))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "USB Controller not found",
+    ))
 }
 
 /// Retrieves USB controller info for the disk in Linux.
@@ -128,7 +138,10 @@ pub fn get_usb_controller_info_linux(disk_path: &str) -> io::Result<String> {
     }
 
     if disk_device.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "Disk device not found"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Disk device not found",
+        ));
     }
 
     let usb_output = Command::new("lsusb").output()?;
@@ -143,7 +156,10 @@ pub fn get_usb_controller_info_linux(disk_path: &str) -> io::Result<String> {
     }
 
     if matched_device.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "USB Controller not found"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "USB Controller not found",
+        ));
     }
 
     Ok(format!("USB Controller Info: {}", matched_device))
@@ -233,9 +249,10 @@ pub fn get_usb_serial_numbers() -> io::Result<String> {
 pub fn get_disk_serial_number(disk_path: &str) -> io::Result<String> {
     match crate::serial::disk_serial(disk_path) {
         Ok(s) => Ok(s),
-        Err(crate::serial::SerialError::NotFound) => {
-            Err(io::Error::new(io::ErrorKind::NotFound, "Serial number not found"))
-        }
+        Err(crate::serial::SerialError::NotFound) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Serial number not found",
+        )),
         Err(crate::serial::SerialError::Io(e)) => Err(e),
         Err(crate::serial::SerialError::Other) => {
             Err(io::Error::new(io::ErrorKind::Other, "Unknown error"))
