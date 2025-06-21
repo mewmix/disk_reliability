@@ -26,6 +26,8 @@ use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 
 mod hardware_info;
+#[cfg(target_os = "macos")]
+mod mac_usb_report;
 mod serial;
 
 // Platform-specific imports
@@ -2241,6 +2243,19 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             match hardware_info::get_usb_serial_numbers() {
                 Ok(serials) => log_simple(&log_file_arc_opt, None, serials),
                 Err(_) => log_simple(&log_file_arc_opt, None, "No USB disk serial numbers found."),
+            }
+            if let Ok(tree) = mac_usb_report::usb_storage_report(path_str) {
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    format!("USB / Controller Tree (incl. power) \u{2193}\n{tree}"),
+                );
+            } else {
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    "USB / Controller Tree: not found or error.",
+                );
             }
         }
         #[cfg(target_os = "linux")]

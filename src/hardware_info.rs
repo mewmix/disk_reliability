@@ -3,11 +3,15 @@ use std::collections::HashMap;
 use std::io;
 use std::process::Command;
 use std::time::Duration;
+#[cfg(not(target_os = "macos"))]
 use sysinfo::Disks;
+#[cfg(target_os = "macos")]
+use plist::Value;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
 /// Retrieves information about the disk at the given path.
+#[cfg(not(target_os = "macos"))]
 pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
     let disks = Disks::new_with_refreshed_list();
     for disk in disks.list() {
@@ -25,6 +29,35 @@ pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
     }
 
     Err(io::Error::new(io::ErrorKind::NotFound, "Disk not found"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
+    let bsd_name = get_bsd_name_from_path(disk_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "Could not resolve BSD name for path")
+    })?;
+    let output = Command::new("diskutil")
+        .arg("info")
+        .arg(&bsd_name)
+        .output()?;
+    let info = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(format!("Diskutil Info for {}:\n{}", bsd_name, info))
+}
+
+#[cfg(target_os = "macos")]
+fn get_bsd_name_from_path(path: &str) -> Option<String> {
+    let output = Command::new("diskutil")
+        .arg("info")
+        .arg("-plist")
+        .arg(path)
+        .output()
+        .ok()?;
+    let plist = Value::from_reader_xml(&*output.stdout).ok()?;
+    plist
+        .as_dictionary()
+        .and_then(|dict| dict.get("DeviceNode"))
+        .and_then(|node| node.as_string())
+        .map(|s| s.to_string())
 }
 
 /// Get the block size for a given disk path (OS-specific)
