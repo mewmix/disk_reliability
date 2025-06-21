@@ -1,3 +1,6 @@
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+
 #[cfg(target_os = "macos")]
 use std::io::{self, ErrorKind};
 #[cfg(target_os = "macos")]
@@ -8,21 +11,40 @@ use plist::Value;
 #[cfg(target_os = "macos")]
 use serde_json::{Map, Value as JsonValue};
 
+/// ----------  GLOBAL CACHE  ----------
+#[cfg(target_os = "macos")]
+static USB_JSON: Lazy<DashMap<(), JsonValue>> = Lazy::new(|| DashMap::new());
+
+fn system_profiler_json() -> io::Result<JsonValue> {
+    if let Some(v) = USB_JSON.get(&()) {
+        return Ok(v.clone());
+    }
+    let output = Command::new("system_profiler")
+        .args(["SPUSBDataType", "-json", "-detailLevel", "mini"])
+        .output()?;
+    let json: JsonValue =
+        serde_json::from_slice(&output.stdout).map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+    USB_JSON.insert((), json.clone());
+    Ok(json)
+}
+
+/// Pretty-prints the full device-path tree (used only when --verbose)
 #[cfg(target_os = "macos")]
 pub fn usb_storage_report(path: &str) -> io::Result<String> {
     let bsd = get_bsd_name_from_path(path).ok_or_else(|| {
         io::Error::new(ErrorKind::NotFound, "Could not resolve BSD name for path")
     })?;
 
-    let output = Command::new("system_profiler")
-        .args(["SPUSBDataType", "-json", "-detailLevel", "mini"])
-        .output()?;
-
-    let json: JsonValue = serde_json::from_slice(&output.stdout)
-        .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+    let json = system_profiler_json()?;
     let root = json
         .get("SPUSBDataType")
-        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
+        .and_then(|n| n.get(0))
+        .and_then(|n| n.get("_items"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| arr.last())
+        .ok_or_else(|| {
+            io::Error::new(ErrorKind::Other, "Unexpected system_profiler output")
+        })?;
 
     let mut stack = Vec::new();
     let path_nodes = search(root, &bsd, &mut stack)
@@ -38,8 +60,62 @@ pub fn usb_storage_report(path: &str) -> io::Result<String> {
     Ok(out)
 }
 
+/// One-liner summary for normal runs.
 #[cfg(target_os = "macos")]
-fn search<'a>(value: &'a JsonValue, bsd: &str, stack: &mut Vec<&'a JsonValue>) -> Option<Vec<&'a JsonValue>> {
+pub fn usb_storage_summary(path: &str) -> io::Result<String> {
+    let bsd = get_bsd_name_from_path(path).ok_or_else(|| {
+        io::Error::new(ErrorKind::NotFound, "Could not resolve BSD name for path")
+    })?;
+
+    let json = system_profiler_json()?;
+    let root = json
+        .get("SPUSBDataType")
+        .and_then(|n| n.get(0))
+        .and_then(|n| n.get("_items"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| arr.last())
+        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Unexpected system_profiler output"))?;
+
+    // Re-use the existing search() helper to fetch the node chain.
+    let mut stack = Vec::new();
+    let path_nodes = search(root, &bsd, &mut stack)
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "USB path not found"))?;
+
+    // Last entry is the actual storage device; its parent is the hub/port.
+    let dev = path_nodes.last().and_then(|n| n.as_object());
+    let hub = if path_nodes.len() >= 2 {
+        path_nodes[path_nodes.len() - 2].as_object()
+    } else {
+        None
+    };
+
+    let dev_name = dev
+        .and_then(|d| d.get("_name").and_then(|v| v.as_str()))
+        .unwrap_or("USB Device");
+    let mfr = dev
+        .and_then(|d| d.get("manufacturer").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let speed = hub
+        .and_then(|h| h.get("speed").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let req_ma = dev
+        .and_then(|d| d.get("current_required").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+    let avail_ma = hub
+        .and_then(|h| h.get("current_available").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+
+    Ok(format!(
+        "{mfr} {dev_name} @ {speed} (uses {req_ma} mA / {avail_ma} mA)"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn search<'a>(
+    value: &'a JsonValue,
+    bsd: &str,
+    stack: &mut Vec<&'a JsonValue>,
+) -> Option<Vec<&'a JsonValue>> {
     match value {
         JsonValue::Object(map) => {
             stack.push(value);
@@ -113,7 +189,9 @@ fn pretty_usb_node(node: &Map<String, JsonValue>, indent: usize, out: &mut Strin
         node.get("current_available").and_then(|v| v.as_u64()),
     ) {
         if req > avail && req != 0 {
-            out.push_str(&format!("{ind}  \u{26a0} draws {req} mA > {avail} mA supplied\n"));
+            out.push_str(&format!(
+                "{ind}  \u{26a0} draws {req} mA > {avail} mA supplied\n"
+            ));
         }
     }
 

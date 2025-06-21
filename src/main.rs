@@ -49,10 +49,6 @@ use winapi::um::{
     winnt::{HANDLE, ULARGE_INTEGER}, // ULARGE_INTEGER is used by GetDiskFreeSpaceExW
 };
 
-#[cfg(all(target_family = "unix", not(target_os = "linux")))]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
@@ -536,7 +532,7 @@ fn open_file_options(
     write: bool,
     create: bool,
     direct_io: bool,
-    log_f: &Option<Arc<Mutex<File>>>,
+    _log_f: &Option<Arc<Mutex<File>>>,
 ) -> OpenOptions {
     let mut opts = OpenOptions::new();
     if read {
@@ -555,7 +551,7 @@ fn open_file_options(
             #[cfg(target_os = "linux")]
             {
                 log_simple(
-                    log_f,
+                    _log_f,
                     None,
                     "Using O_DIRECT on Linux. Ensure buffer/IO alignment and block size multiple of 512B.",
                 );
@@ -564,7 +560,7 @@ fn open_file_options(
             #[cfg(target_os = "windows")]
             {
                 log_simple(
-                    log_f,
+                    _log_f,
                     None,
                     "Using FILE_FLAG_NO_BUFFERING on Windows. Ensure sector alignment and block size multiple of 512B.",
                 );
@@ -573,7 +569,7 @@ fn open_file_options(
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 log_simple(
-                    log_f,
+                    _log_f,
                     None,
                     "Direct I/O requested but not supported on this platform. Ignored.",
                 );
@@ -584,7 +580,7 @@ fn open_file_options(
             // Suppress unused variable warning if direct_io is always false
             let _ = direct_io;
             log_simple(
-                log_f,
+                _log_f,
                 None,
                 "Direct I/O not enabled in this build. Using standard buffered I/O.",
             );
@@ -2231,31 +2227,26 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     format!("Block Size: {} bytes", bsize),
                 );
             }
-            if let Ok(usb) = hardware_info::get_usb_controller_info_macos(path_str) {
-                log_simple(&log_file_arc_opt, None, usb);
-            } else {
-                log_simple(
+            match mac_usb_report::usb_storage_summary(path_str) {
+                Ok(s) => log_simple(&log_file_arc_opt, None, s),
+                Err(_) => log_simple(
                     &log_file_arc_opt,
                     None,
                     "USB controller information unavailable.",
-                );
+                ),
             }
             match hardware_info::get_usb_serial_numbers() {
                 Ok(serials) => log_simple(&log_file_arc_opt, None, serials),
                 Err(_) => log_simple(&log_file_arc_opt, None, "No USB disk serial numbers found."),
             }
-            if let Ok(tree) = mac_usb_report::usb_storage_report(path_str) {
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
-                    format!("USB / Controller Tree (incl. power) \u{2193}\n{tree}"),
-                );
-            } else {
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
-                    "USB / Controller Tree: not found or error.",
-                );
+            if cli.verbose {
+                if let Ok(tree) = mac_usb_report::usb_storage_report(path_str) {
+                    log_simple(
+                        &log_file_arc_opt,
+                        None,
+                        format!("USB / Controller Tree (incl. power) \u{2193}\n{tree}"),
+                    );
+                }
             }
         }
         #[cfg(target_os = "linux")]

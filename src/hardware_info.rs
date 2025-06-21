@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use plist::Value;
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
 use std::io;
@@ -5,8 +7,6 @@ use std::process::Command;
 use std::time::Duration;
 #[cfg(not(target_os = "macos"))]
 use sysinfo::Disks;
-#[cfg(target_os = "macos")]
-use plist::Value;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
@@ -34,7 +34,10 @@ pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
 #[cfg(target_os = "macos")]
 pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
     let bsd_name = get_bsd_name_from_path(disk_path).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "Could not resolve BSD name for path")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not resolve BSD name for path",
+        )
     })?;
     let output = Command::new("diskutil")
         .arg("info")
@@ -198,13 +201,7 @@ pub fn get_usb_controller_info_linux(disk_path: &str) -> io::Result<String> {
     Ok(format!("USB Controller Info: {}", matched_device))
 }
 
-#[cfg(target_os = "macos")]
-pub fn get_usb_controller_info_macos(_disk_path: &str) -> io::Result<String> {
-    let output = Command::new("system_profiler")
-        .args(["SPUSBDataType"])
-        .output()?;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
+// removed – call mac_usb_report::usb_storage_summary() instead
 
 /// Lists connected USB devices and attempts to read their serial numbers using libusb.
 pub fn get_usb_serial_numbers() -> io::Result<String> {
