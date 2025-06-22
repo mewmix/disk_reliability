@@ -139,12 +139,12 @@ fn mac_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
 
     let rotational = dict
         .get("SolidState")
-        .and_then(|v| v.as_bool())
+        .and_then(|v| v.as_boolean())
         .map(|solid| !solid);
 
     let sector_size = dict
         .get("DeviceBlockSize")
-        .and_then(|v| v.as_integer())
+        .and_then(|v| v.as_signed_integer())
         .map(|n| n as u32);
 
     let media = if rotational == Some(true) {
