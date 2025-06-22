@@ -25,6 +25,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 
+mod controller_tree;
+mod drive_descriptor;
 mod hardware_info;
 #[cfg(target_os = "macos")]
 mod mac_usb_report;
