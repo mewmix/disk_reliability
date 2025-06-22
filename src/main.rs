@@ -2250,6 +2250,11 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     format!("Block Size: {} bytes", bsize),
                 );
             }
+            if let Some(bsd) = hardware_info::get_bsd_name_from_path(path_str) {
+                if let Ok(smart) = hardware_info::smart_metrics(&bsd) {
+                    log_simple(&log_file_arc_opt, None, format!("SMART {:?}", smart));
+                }
+            }
             match mac_usb_report::usb_storage_summary(path_str) {
                 Ok(s) => log_simple(&log_file_arc_opt, None, s),
                 Err(_) => log_simple(
