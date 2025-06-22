@@ -361,6 +361,19 @@ fn log_simple<S: AsRef<str>>(
     log_message_internal(log_f, pb, msg_with_ts);
 }
 
+fn log_drive_info<P: AsRef<Path>>(log_f: &Option<Arc<Mutex<File>>>, p: P) {
+    if let Some(s) = p.as_ref().as_os_str().to_str() {
+        if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(s) {
+            log_simple(log_f, None, format!("Drive: {:?}", dd));
+        }
+        if let Ok(tree) = controller_tree::controller_tree_for_path(s) {
+            for n in tree {
+                log_simple(log_f, None, format!("  └─ {}", n.label));
+            }
+        }
+    }
+}
+
 fn log_error(
     log_f: &Option<Arc<Mutex<File>>>,
     pb: Option<&Arc<ProgressBar>>,
@@ -2315,16 +2328,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let use_direct_io = false;
 
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
-            if let Some(pstr) = file_path.to_str() {
-                if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(pstr) {
-                    log_simple(&log_file_arc_opt, None, format!("Drive: {:?}", dd));
-                }
-                if let Ok(tree) = controller_tree::controller_tree_for_path(pstr) {
-                    for n in tree {
-                        log_simple(&log_file_arc_opt, None, format!("  └─ {}", n.label));
-                    }
-                }
-            }
+            log_drive_info(&log_file_arc_opt, &file_path);
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 {
                 log_simple(
@@ -2513,16 +2517,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let use_direct_io = false;
 
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
-            if let Some(pstr) = file_path.to_str() {
-                if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(pstr) {
-                    log_simple(&log_file_arc_opt, None, format!("Drive: {:?}", dd));
-                }
-                if let Ok(tree) = controller_tree::controller_tree_for_path(pstr) {
-                    for n in tree {
-                        log_simple(&log_file_arc_opt, None, format!("  └─ {}", n.label));
-                    }
-                }
-            }
+            log_drive_info(&log_file_arc_opt, &file_path);
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 {
                 log_simple(
@@ -2564,16 +2559,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let use_direct_io = false;
 
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
-            if let Some(pstr) = file_path.to_str() {
-                if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(pstr) {
-                    log_simple(&log_file_arc_opt, None, format!("Drive: {:?}", dd));
-                }
-                if let Ok(tree) = controller_tree::controller_tree_for_path(pstr) {
-                    for n in tree {
-                        log_simple(&log_file_arc_opt, None, format!("  └─ {}", n.label));
-                    }
-                }
-            }
+            log_drive_info(&log_file_arc_opt, &file_path);
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 {
                 log_simple(
@@ -2638,16 +2624,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let use_direct_io = false;
 
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
-            if let Some(pstr) = file_path.to_str() {
-                if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(pstr) {
-                    log_simple(&log_file_arc_opt, None, format!("Drive: {:?}", dd));
-                }
-                if let Ok(tree) = controller_tree::controller_tree_for_path(pstr) {
-                    for n in tree {
-                        log_simple(&log_file_arc_opt, None, format!("  └─ {}", n.label));
-                    }
-                }
-            }
+            log_drive_info(&log_file_arc_opt, &file_path);
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 {
                 log_simple(
@@ -2692,16 +2669,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let use_direct_io = false;
 
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
-            if let Some(pstr) = file_path.to_str() {
-                if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(pstr) {
-                    log_simple(&log_file_arc_opt, None, format!("Drive: {:?}", dd));
-                }
-                if let Ok(tree) = controller_tree::controller_tree_for_path(pstr) {
-                    for n in tree {
-                        log_simple(&log_file_arc_opt, None, format!("  └─ {}", n.label));
-                    }
-                }
-            }
+            log_drive_info(&log_file_arc_opt, &file_path);
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 {
                 log_simple(
@@ -2769,16 +2737,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             let use_direct_io = false;
 
             let file_path = resolve_file_path(Some(path), &log_file_arc_opt)?;
-            if let Some(pstr) = file_path.to_str() {
-                if let Ok(dd) = drive_descriptor::drive_descriptor_from_path(pstr) {
-                    log_simple(&log_file_arc_opt, None, format!("Drive: {:?}", dd));
-                }
-                if let Ok(tree) = controller_tree::controller_tree_for_path(pstr) {
-                    for n in tree {
-                        log_simple(&log_file_arc_opt, None, format!("  └─ {}", n.label));
-                    }
-                }
-            }
+            log_drive_info(&log_file_arc_opt, &file_path);
             let mut actual_block_size_u64 = block_size;
             if actual_block_size_u64 == 0 {
                 log_simple(

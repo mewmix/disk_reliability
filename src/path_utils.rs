@@ -9,18 +9,28 @@ pub fn canonical_block<P: AsRef<Path>>(p: P) -> io::Result<PathBuf> {
         use plist::Value;
         use std::process::Command;
 
-        let out = Command::new("diskutil")
-            .args(["info", "-plist", p.as_ref().to_str().unwrap()])
-            .output()?;
-        let dict = Value::from_reader_xml(&*out.stdout)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            .into_dictionary()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "plist parse fail"))?;
-        let dev = dict
-            .get("DeviceNode")
-            .and_then(Value::as_string)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no DeviceNode"))?;
-        return Ok(PathBuf::from(dev));
+        let mut current = p.as_ref();
+        loop {
+            let out = Command::new("diskutil")
+                .args(["info", "-plist", current.to_str().unwrap()])
+                .output()?;
+            if out.status.success() {
+                let dict = Value::from_reader_xml(&*out.stdout)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                    .into_dictionary()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "plist parse fail"))?;
+                let dev = dict
+                    .get("DeviceNode")
+                    .and_then(Value::as_string)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no DeviceNode"))?;
+                return Ok(PathBuf::from(dev));
+            }
+            if let Some(parent) = current.parent() {
+                current = parent;
+                continue;
+            }
+            return Err(io::Error::new(io::ErrorKind::Other, "cannot resolve"));
+        }
     }
 
     #[cfg(target_os = "linux")]

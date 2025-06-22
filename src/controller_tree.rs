@@ -71,7 +71,7 @@ fn linux_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
             pid,
         });
 
-        if path == Path::new("/sys/devices") {
+        if path.starts_with("/sys/devices") && path.parent().is_none() {
             break;
         }
         if !path.pop() {

@@ -93,10 +93,10 @@ fn linux_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
         })
         .unwrap_or(BusType::Unknown);
 
-    let media = if rotational == Some(true) {
-        MediaKind::Hdd
-    } else {
-        MediaKind::Ssd
+    let media = match rotational {
+        Some(true) => MediaKind::Hdd,
+        Some(false) => MediaKind::Ssd,
+        None => MediaKind::Unknown,
     };
 
     Ok(DriveDescriptor {
@@ -127,7 +127,8 @@ fn mac_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "unexpected output"))?;
 
     let bus = dict
-        .get("BusProtocol")
+        .get("Protocol")
+        .or_else(|| dict.get("BusProtocol"))
         .and_then(|v| v.as_string())
         .map(|s| match s.to_ascii_lowercase().as_str() {
             "usb" => BusType::Usb,
@@ -186,7 +187,7 @@ fn win_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
     unsafe {
         let handle = CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             ptr::null_mut(),
             3, // OPEN_EXISTING
