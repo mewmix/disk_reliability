@@ -84,8 +84,49 @@ fn linux_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
 
 #[cfg(target_os = "macos")]
 fn mac_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
-    let _ = crate::path_utils::canonical_block(p)?;
-    Ok(Vec::new())
+    use plist::Value;
+    use std::{io, process::Command};
+
+    let dev = crate::path_utils::canonical_block(p)?;
+    let dev_str = dev
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "utf-8 path"))?;
+
+    let out = Command::new("diskutil")
+        .args(["info", "-plist", dev_str])
+        .output()?;
+    let dict = Value::from_reader_xml(&*out.stdout)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .into_dictionary()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "plist parse"))?;
+
+    let path_field = dict
+        .get("DeviceTreePath")
+        .and_then(Value::as_string)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "missing DeviceTreePath"))?;
+
+    let mut nodes = Vec::<ControllerNode>::new();
+    for segment in path_field
+        .trim_start_matches("IODeviceTree:")
+        .trim_start_matches('/')
+        .split('/')
+    {
+        let bus = if segment.contains("USB") || segment.contains("XHC") {
+            BusType::Usb
+        } else if segment.contains("PCI") {
+            BusType::Thunderbolt
+        } else {
+            BusType::Unknown
+        };
+        nodes.push(ControllerNode {
+            label: segment.to_string(),
+            bus,
+            vid: None,
+            pid: None,
+        });
+    }
+
+    Ok(nodes)
 }
 
 #[cfg(target_os = "windows")]
