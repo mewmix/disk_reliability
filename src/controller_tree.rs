@@ -30,8 +30,8 @@ pub fn controller_tree_for_path(p: &str) -> std::io::Result<Vec<ControllerNode>>
 #[cfg(target_os = "linux")]
 fn linux_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
     use std::{fs, io, path::Path};
-
-    let dev = fs::canonicalize(p)?;
+    let path = crate::path_utils::canonical_block(p)?;
+    let dev = fs::canonicalize(&path)?;
     let name = dev
         .file_name()
         .and_then(|s| s.to_str())
@@ -83,11 +83,13 @@ fn linux_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_tree(_p: &str) -> std::io::Result<Vec<ControllerNode>> {
+fn mac_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
+    let _ = crate::path_utils::canonical_block(p)?;
     Ok(Vec::new())
 }
 
 #[cfg(target_os = "windows")]
-fn win_tree(_p: &str) -> std::io::Result<Vec<ControllerNode>> {
+fn win_tree(p: &str) -> std::io::Result<Vec<ControllerNode>> {
+    let _ = crate::path_utils::canonical_block(p)?;
     Ok(Vec::new())
 }

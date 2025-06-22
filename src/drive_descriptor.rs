@@ -61,7 +61,8 @@ pub fn drive_descriptor_from_path(p: &str) -> std::io::Result<DriveDescriptor> {
 fn linux_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
     use std::{fs, io, path::Path};
 
-    let dev = fs::canonicalize(p)?;
+    let path = crate::path_utils::canonical_block(p)?;
+    let dev = fs::canonicalize(&path)?;
     let name = dev
         .file_name()
         .and_then(|s| s.to_str())
@@ -111,10 +112,12 @@ fn mac_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
     use plist::Value;
     use std::{io, process::Command};
 
+    let path = crate::path_utils::canonical_block(p)?;
+
     let out = Command::new("diskutil")
         .arg("info")
         .arg("-plist")
-        .arg(p)
+        .arg(&path)
         .output()?;
 
     let plist = Value::from_reader_xml(&*out.stdout)
@@ -173,8 +176,10 @@ fn win_descriptor(p: &str) -> std::io::Result<DriveDescriptor> {
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE},
     };
 
-    let mut wide: Vec<u16> = std::ffi::OsStr::new(p).encode_wide().collect();
-    if !p.ends_with('\0') {
+    let path = crate::path_utils::canonical_block(p)?;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if !wide.last().map(|w| *w == 0).unwrap_or(false) {
         wide.push(0);
     }
 
