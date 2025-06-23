@@ -31,6 +31,7 @@ mod mac_usb_report;
 #[cfg(all(target_os = "macos", feature = "direct"))]
 mod macos_direct;
 mod serial;
+mod full_drive_report;
 
 // Platform-specific imports
 #[cfg(all(target_os = "linux", feature = "direct"))]
