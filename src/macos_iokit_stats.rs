@@ -3,15 +3,42 @@
 
 #![cfg(target_os = "macos")]
 
-use core_foundation_sys::base::kCFAllocatorDefault;
-use io_kit_sys::{
-    io_iterator_t, io_object_t, io_service_t, IOIteratorNext, IORegistryEntryCreateCFProperties,
-    IOServiceGetMatchingServices, IOServiceMatching, KERN_SUCCESS,
+use core_foundation_sys::base::{kCFAllocatorDefault, CFRelease};
+use core_foundation_sys::data::{CFDataGetBytePtr, CFDataGetLength};
+use core_foundation_sys::propertylist::{
+    kCFPropertyListXMLFormat_v1_0, CFPropertyListCreateData, CFPropertyListRef,
 };
+use io_kit_sys::{
+    self,
+    types::{io_iterator_t, io_object_t, io_service_t},
+    IOIteratorNext, IORegistryEntryCreateCFProperties, IOServiceGetMatchingServices,
+    IOServiceMatching,
+};
+use mach2::kern_return::KERN_SUCCESS;
 use plist::{Dictionary, Value};
 use std::{ffi::CString, io, ptr};
 
 use crate::hardware_info::SmartMetrics; // <-- your shared struct
+
+/// Convert a CoreFoundation property list into a [`plist::Value`].
+unsafe fn cf_plist_to_value(plist: CFPropertyListRef) -> io::Result<Value> {
+    let data = CFPropertyListCreateData(
+        kCFAllocatorDefault,
+        plist,
+        kCFPropertyListXMLFormat_v1_0,
+        0,
+        std::ptr::null_mut(),
+    );
+    if data.is_null() {
+        return Err(ioerr("CFPropertyListCreateData failed"));
+    }
+    let len = CFDataGetLength(data) as usize;
+    let ptr = CFDataGetBytePtr(data);
+    let slice = std::slice::from_raw_parts(ptr, len);
+    let value = Value::from_reader_xml(slice).map_err(|_| ioerr("plist parse failed"));
+    CFRelease(data as _);
+    value
+}
 
 /// Public entry-point used by main.rs
 pub fn smart_metrics_from_bsd(bsd_name: &str) -> io::Result<SmartMetrics> {
@@ -50,18 +77,23 @@ fn pull_smart_dict(class_name: &str, bsd: &str) -> io::Result<Dictionary> {
                 svc = IOIteratorNext(it);
                 continue;
             }
-            let v = Value::from_cf_type_ref(cf_props);
-            // The SMART user-client itself doesn\'t contain the BSD name; walk one
+            let v = cf_plist_to_value(cf_props as CFPropertyListRef)?;
+            // The SMART user-client itself doesn't contain the BSD name; walk one
             // level up ("IOBlockStorageDevice") via the "Parent Root" key.
-            if let Some(Value::Dictionary(dict)) = v.lookup("Parent Root") {
+            if let Some(Value::Dictionary(dict)) = v
+                .as_dictionary()
+                .and_then(|root| root.get("Parent Root"))
+                .and_then(Value::as_dictionary)
+            {
                 if dict
-                    .lookup("BSD Name")
+                    .get("BSD Name")
                     .and_then(Value::as_string)
                     .map(|s| s.eq_ignore_ascii_case(bsd))
                     .unwrap_or(false)
                 {
                     return v
-                        .lookup("SMART Data")
+                        .as_dictionary()
+                        .and_then(|root| root.get("SMART Data"))
                         .and_then(Value::as_dictionary)
                         .cloned()
                         .ok_or_else(|| ioerr("SMART Data key missing"));
@@ -75,18 +107,22 @@ fn pull_smart_dict(class_name: &str, bsd: &str) -> io::Result<Dictionary> {
 
 fn parse_nvme(d: Dictionary) -> io::Result<SmartMetrics> {
     let mut m = SmartMetrics::default();
-    m.power_on_hours = d.lookup("PowerOnHours").and_then(Value::as_u64);
-    m.unexpected_power_loss = d.lookup("UnsafeShutdowns").and_then(Value::as_u64);
-    m.media_errors = d.lookup("MediaErrors").and_then(Value::as_u64);
-    m.data_units_written = d.lookup("DataUnitsWritten").and_then(Value::as_u64);
-    m.data_units_read = d.lookup("DataUnitsRead").and_then(Value::as_u64);
+    m.power_on_hours = d.get("PowerOnHours").and_then(Value::as_unsigned_integer);
+    m.unexpected_power_loss = d
+        .get("UnsafeShutdowns")
+        .and_then(Value::as_unsigned_integer);
+    m.media_errors = d.get("MediaErrors").and_then(Value::as_unsigned_integer);
+    m.data_units_written = d
+        .get("DataUnitsWritten")
+        .and_then(Value::as_unsigned_integer);
+    m.data_units_read = d.get("DataUnitsRead").and_then(Value::as_unsigned_integer);
     m.percentage_used = d
-        .lookup("PercentageUsed")
-        .and_then(Value::as_u64)
+        .get("PercentageUsed")
+        .and_then(Value::as_unsigned_integer)
         .map(|v| v as u8);
-    m.temperature_c = d.lookup("Temperature").and_then(Value::as_f64);
+    m.temperature_c = d.get("Temperature").and_then(Value::as_real);
     m.smart_overall_health = d
-        .lookup("OverallHealth")
+        .get("OverallHealth")
         .and_then(Value::as_string)
         .map(|s| s.to_string());
     Ok(m)
@@ -95,13 +131,13 @@ fn parse_nvme(d: Dictionary) -> io::Result<SmartMetrics> {
 fn parse_sata(d: Dictionary) -> io::Result<SmartMetrics> {
     let mut m = SmartMetrics::default();
     m.smart_overall_health = d
-        .lookup("OverallHealth")
+        .get("OverallHealth")
         .and_then(Value::as_string)
         .map(|s| s.to_string());
-    m.power_on_hours = d.lookup("PowerOnHours").and_then(Value::as_u64);
-    m.power_cycle_count = d.lookup("PowerCycles").and_then(Value::as_u64);
-    m.media_errors = d.lookup("MediaErrors").and_then(Value::as_u64);
-    m.temperature_c = d.lookup("Temperature").and_then(Value::as_f64);
+    m.power_on_hours = d.get("PowerOnHours").and_then(Value::as_unsigned_integer);
+    m.power_cycle_count = d.get("PowerCycles").and_then(Value::as_unsigned_integer);
+    m.media_errors = d.get("MediaErrors").and_then(Value::as_unsigned_integer);
+    m.temperature_c = d.get("Temperature").and_then(Value::as_real);
     Ok(m)
 }
 
