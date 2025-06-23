@@ -24,7 +24,7 @@ use ctrlc;
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
-
+use std::ptr;
 mod hardware_info;
 #[cfg(target_os = "macos")]
 mod mac_usb_report;
