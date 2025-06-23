@@ -5,9 +5,11 @@
 
 use core_foundation_sys::base::kCFAllocatorDefault;
 use io_kit_sys::{
-    io_iterator_t, io_object_t, io_service_t, IOIteratorNext, IORegistryEntryCreateCFProperties,
-    IOServiceGetMatchingServices, IOServiceMatching, KERN_SUCCESS,
+    IOIteratorNext, IORegistryEntryCreateCFProperties, IOServiceGetMatchingServices,
+    IOServiceMatching,
 };
+use io_kit_sys::types::{io_iterator_t, io_object_t, io_service_t};
+use mach2::kern_return::KERN_SUCCESS;
 use plist::{Dictionary, Value};
 use std::{ffi::CString, io, ptr};
 
