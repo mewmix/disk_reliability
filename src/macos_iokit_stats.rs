@@ -11,8 +11,8 @@ use core_foundation_sys::propertylist::{
 use io_kit_sys::{
     self,
     types::{io_iterator_t, io_object_t, io_service_t},
-    IOIteratorNext, IORegistryEntryCreateCFProperties, IOServiceGetMatchingServices,
-    IOServiceMatching,
+    IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
+    IOServiceGetMatchingServices, IOServiceMatching,
 };
 use mach2::kern_return::KERN_SUCCESS;
 use plist::{Dictionary, Value};
@@ -74,10 +74,12 @@ fn pull_smart_dict(class_name: &str, bsd: &str) -> io::Result<Dictionary> {
             let mut cf_props = ptr::null_mut();
             IORegistryEntryCreateCFProperties(svc, &mut cf_props, kCFAllocatorDefault, 0);
             if cf_props.is_null() {
+                IOObjectRelease(svc);
                 svc = IOIteratorNext(it);
                 continue;
             }
             let v = cf_plist_to_value(cf_props as CFPropertyListRef)?;
+            CFRelease(cf_props as _);
             // The SMART user-client itself doesn't contain the BSD name; walk one
             // level up ("IOBlockStorageDevice") via the "Parent Root" key.
             if let Some(Value::Dictionary(dict)) = v
@@ -91,16 +93,21 @@ fn pull_smart_dict(class_name: &str, bsd: &str) -> io::Result<Dictionary> {
                     .map(|s| s.eq_ignore_ascii_case(bsd))
                     .unwrap_or(false)
                 {
-                    return v
+                    let res = v
                         .as_dictionary()
                         .and_then(|root| root.get("SMART Data"))
                         .and_then(Value::as_dictionary)
                         .cloned()
                         .ok_or_else(|| ioerr("SMART Data key missing"));
+                    IOObjectRelease(svc);
+                    IOObjectRelease(it as io_object_t);
+                    return res;
                 }
             }
+            IOObjectRelease(svc);
             svc = IOIteratorNext(it);
         }
+        IOObjectRelease(it as io_object_t);
         Err(ioerr("service not found"))
     }
 }

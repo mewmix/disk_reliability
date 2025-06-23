@@ -65,8 +65,9 @@ Common flags (global or per‑command):
 --block-size <SIZE>      Logical sector size, accepts 4K, 1M, 512, etc. (default 4K)
 --batch-size <SIZE>      Bytes processed per worker batch (default 1M)
 --threads <N>            Worker thread count (default 1; I/O is single‑fd so >1 rarely helps)
---data-type <hex|text|binary|file>   Pattern generator (default binary)
+--data-type <hex|text|binary|file|random>   Pattern generator (default binary)
 --data-file <FILE>       Pattern source when --data-type file
+--dual-pattern           Alternate between random and sequential data
 --passes <1‑3>           Repeat full-test up to 3 times (default 1)
 --resume-from-sector <S> Start offset inside existing file
 --preallocate            posix_fallocate / SetFileInformationByHandle before test
