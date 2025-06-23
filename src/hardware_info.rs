@@ -10,6 +10,25 @@ use sysinfo::Disks;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
+#[cfg(target_os = "macos")]
+mod macos_iokit_stats;
+#[cfg(target_os = "macos")]
+pub use macos_iokit_stats::smart_metrics_from_bsd as smart_metrics;
+
+/// Basic SMART/health metrics gathered from the platform.
+#[derive(Debug, Default)]
+pub struct SmartMetrics {
+    pub power_on_hours: Option<u64>,
+    pub power_cycle_count: Option<u64>,
+    pub unexpected_power_loss: Option<u64>,
+    pub media_errors: Option<u64>,
+    pub data_units_written: Option<u64>,
+    pub data_units_read: Option<u64>,
+    pub percentage_used: Option<u8>,
+    pub temperature_c: Option<f64>,
+    pub smart_overall_health: Option<String>,
+}
+
 /// Retrieves information about the disk at the given path.
 #[cfg(not(target_os = "macos"))]
 pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
@@ -48,7 +67,7 @@ pub fn get_disk_info(disk_path: &str) -> io::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn get_bsd_name_from_path(path: &str) -> Option<String> {
+pub fn get_bsd_name_from_path(path: &str) -> Option<String> {
     let output = Command::new("diskutil")
         .arg("info")
         .arg("-plist")
