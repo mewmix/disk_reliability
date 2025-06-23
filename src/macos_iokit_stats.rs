@@ -9,7 +9,6 @@ use core_foundation_sys::propertylist::{
     kCFPropertyListXMLFormat_v1_0, CFPropertyListCreateData, CFPropertyListRef,
 };
 use io_kit_sys::{
-    self,
     types::{io_iterator_t, io_object_t, io_service_t},
     IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
     IOServiceGetMatchingServices, IOServiceMatching,
