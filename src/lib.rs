@@ -34,8 +34,10 @@ impl LeanTest {
 pub struct TestResult {
     pub label: &'static str,
     pub bytes_processed: u64,
-    pub seconds: f64,
-    pub throughput_mib_s: f64,
+    pub write_seconds: f64,
+    pub read_seconds: f64,
+    pub write_mib_s: f64,
+    pub read_mib_s: f64,
 }
 
 impl TestResult {
@@ -44,8 +46,10 @@ impl TestResult {
         json!({
             "label": self.label,
             "bytes_processed": self.bytes_processed,
-            "seconds": self.seconds,
-            "throughput_mib_s": self.throughput_mib_s,
+            "write_seconds": self.write_seconds,
+            "read_seconds": self.read_seconds,
+            "write_mib_s": self.write_mib_s,
+            "read_mib_s": self.read_mib_s,
         })
     }
 }
@@ -55,7 +59,7 @@ impl TestResult {
 /// The test writes and then reads a small amount of data using
 /// parameters derived from [`LeanTest`]. The return value is either a
 /// formatted string or a JSON string if `as_json` is `true`.
-pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, as_json: bool) -> io::Result<String> {
+pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest) -> io::Result<TestResult> {
     let (block_size, queue_depth, random, label) = test.params();
     // Use a very small footprint to keep the test quick.
     let blocks = queue_depth * 32; // 32 batches of the queue depth
@@ -71,7 +75,7 @@ pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, as_json: bool) -> 
     let mut buffer = vec![0u8; block_size];
     let mut rng = thread_rng();
 
-    let start = Instant::now();
+    let start_write = Instant::now();
     // Write phase
     for i in 0..blocks {
         if random {
@@ -85,7 +89,9 @@ pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, as_json: bool) -> 
         file.write_all(&buffer)?;
     }
     file.sync_all()?;
+    let write_secs = start_write.elapsed().as_secs_f64();
 
+    let start_read = Instant::now();
     // Read phase
     for i in 0..blocks {
         if random {
@@ -97,26 +103,19 @@ pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, as_json: bool) -> 
         }
         file.read_exact(&mut buffer)?;
     }
-    let duration = start.elapsed();
-    let secs = duration.as_secs_f64();
-    let throughput = (total_bytes as f64 * 2.0 / (1024.0 * 1024.0)) / secs; // write + read
+    let read_secs = start_read.elapsed().as_secs_f64();
+    let write_mib_s = (total_bytes as f64 / (1024.0 * 1024.0)) / write_secs;
+    let read_mib_s = (total_bytes as f64 / (1024.0 * 1024.0)) / read_secs;
 
     let result = TestResult {
         label,
         bytes_processed: total_bytes * 2,
-        seconds: secs,
-        throughput_mib_s: throughput,
+        write_seconds: write_secs,
+        read_seconds: read_secs,
+        write_mib_s,
+        read_mib_s,
     };
-
-    let output = if as_json {
-        result.to_json().to_string()
-    } else {
-        format!(
-            "{}: {:.2} MiB/s over {:.2} s",
-            result.label, result.throughput_mib_s, result.seconds
-        )
-    };
-    Ok(output)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -127,8 +126,8 @@ mod tests {
     #[test]
     fn json_output() {
         let tmp = NamedTempFile::new().unwrap();
-        let out = run_lean_test(tmp.path(), LeanTest::Seq1Mq1t1, true).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let result = run_lean_test(tmp.path(), LeanTest::Seq1Mq1t1).unwrap();
+        let v = result.to_json();
         assert_eq!(v["label"], "SEQ1M Q1T1");
     }
 }

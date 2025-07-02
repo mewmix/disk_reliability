@@ -52,7 +52,7 @@ The binary understands **seven** sub‑commands (run with `--help` for the full 
 | Sub‑command    | Purpose                                                            |
 | -------------- | ------------------------------------------------------------------ |
 | `full-test`    | End‑to‑end write → read → verify of a contiguous region (default). |
-| `bench`        | Run a preset lightweight benchmark and print throughput. |
+| `bench`        | Run a preset lightweight benchmark with optional JSON output. |
 | `read-sector`  | Dump a single logical sector to stdout/log.                        |
 | `write-sector` | Overwrite one sector with a chosen pattern.                        |
 | `range-read`   | Sequentially read a slice and optionally hex‑preview the data.     |
@@ -105,8 +105,9 @@ $ disk-tester verify-range --path /images/firmware.img \
 ### 4.4 Run a quick benchmark
 
 ```bash
-$ disk-tester bench --path ./test.bin --mode seq1m-q8t1
+$ disk-tester bench --path ./test.bin --mode seq1m-q8t1 --json
 ```
+Outputs a JSON summary with separate read and write speeds.
 
 ---
 

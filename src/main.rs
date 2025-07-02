@@ -21,11 +21,11 @@ use chrono::Local;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use ctrlc;
+use disk_tester::{run_lean_test, LeanTest};
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 use std::ptr;
-use disk_tester::{run_lean_test, LeanTest};
 mod hardware_info;
 #[cfg(target_os = "macos")]
 mod mac_usb_report;
@@ -268,7 +268,7 @@ enum Commands {
         path: Option<PathBuf>,
         #[clap(long, value_enum, default_value = "seq1m-q8t1")]
         mode: LeanTestChoice,
-        #[clap(long, help = "Emit output in JSON format")] 
+        #[clap(long, help = "Emit output in JSON format")]
         json: bool,
     },
     ReadSector {
@@ -2036,6 +2036,15 @@ fn format_bytes_float(bytes: u64) -> (f64, &'static str) {
     }
 }
 
+fn simple_resolve(cli_path: Option<PathBuf>) -> PathBuf {
+    let base = cli_path.unwrap_or_else(|| PathBuf::from("."));
+    if base.is_dir() {
+        base.join(TEST_FILE_NAME)
+    } else {
+        base
+    }
+}
+
 fn resolve_file_path(
     cli_path: Option<PathBuf>,
     log_f: &Option<Arc<Mutex<File>>>,
@@ -2181,6 +2190,19 @@ fn main() {
 fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
     setup_signal_handler();
     let cli = Cli::parse();
+    if let Commands::Bench {
+        path,
+        mode,
+        json: true,
+    } = &cli.command
+    {
+        let file_path = simple_resolve(path.clone());
+        let test: LeanTest = mode.clone().into();
+        let result = run_lean_test(&file_path, test)?;
+        println!("{}", result.to_json());
+        let _ = fs::remove_file(&file_path);
+        return Ok(());
+    }
     log_simple(&log_file_arc_opt, None, "Starting Disk Test Tool...");
     log_simple(
         &log_file_arc_opt,
@@ -2575,8 +2597,19 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
         Commands::Bench { path, mode, json } => {
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
             let test: LeanTest = mode.into();
-            let result = run_lean_test(&file_path, test, json)?;
-            log_simple(&log_file_arc_opt, None, result);
+            let result = run_lean_test(&file_path, test)?;
+            if json {
+                println!("{}", result.to_json());
+            } else {
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    format!(
+                        "{} Write {:.2} MiB/s, Read {:.2} MiB/s",
+                        result.label, result.write_mib_s, result.read_mib_s
+                    ),
+                );
+            }
             let _ = fs::remove_file(&file_path);
         }
         Commands::ReadSector {
