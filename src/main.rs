@@ -1916,6 +1916,8 @@ fn full_reliability_test(
                     } else {
                         format!("First mismatch at byte offset {} in batch", diff_offset)
                     };
+                    let expected_buf = msg.expected_byte.map(|b| [b]);
+                    let actual_buf = msg.actual_byte.map(|b| [b]);
                     log_error(
                         &log_f_opt,
                         Some(&pb_arc),
@@ -1923,8 +1925,8 @@ fn full_reliability_test(
                         msg.abs_start_sector,
                         "Data Mismatch",
                         &detail,
-                        None,
-                        None,
+                        expected_buf.as_ref().map(|b| b.as_slice()),
+                        actual_buf.as_ref().map(|b| b.as_slice()),
                         Some(file_path_owned.clone()),
                     );
                 }
