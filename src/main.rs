@@ -25,6 +25,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 use std::ptr;
+use disk_tester::{run_lean_test, LeanTest};
 mod hardware_info;
 #[cfg(target_os = "macos")]
 mod mac_usb_report;
@@ -91,6 +92,29 @@ enum DataTypeChoice {
     Binary,
     File,
     Random,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum LeanTestChoice {
+    #[clap(name = "seq1m-q8t1", help = "Sequential 1MiB blocks, QD8, 1 thread")]
+    Seq1Mq8t1,
+    #[clap(name = "seq1m-q1t1", help = "Sequential 1MiB blocks, single queue")]
+    Seq1Mq1t1,
+    #[clap(name = "rnd4k-q32t16", help = "Random 4KiB blocks, QD32, 16 threads")]
+    Rnd4kQ32T16,
+    #[clap(name = "rnd4k-q1t1", help = "Random 4KiB blocks, single queue")]
+    Rnd4kQ1t1,
+}
+
+impl From<LeanTestChoice> for disk_tester::LeanTest {
+    fn from(c: LeanTestChoice) -> Self {
+        match c {
+            LeanTestChoice::Seq1Mq8t1 => disk_tester::LeanTest::Seq1Mq8t1,
+            LeanTestChoice::Seq1Mq1t1 => disk_tester::LeanTest::Seq1Mq1t1,
+            LeanTestChoice::Rnd4kQ32T16 => disk_tester::LeanTest::Rnd4kQ32T16,
+            LeanTestChoice::Rnd4kQ1t1 => disk_tester::LeanTest::Rnd4kQ1t1,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +262,14 @@ enum Commands {
             help = "Number of passes for the full test (max 3)."
         )]
         passes: usize,
+    },
+    Bench {
+        #[clap(long)]
+        path: Option<PathBuf>,
+        #[clap(long, value_enum, default_value = "seq1m-q8t1")]
+        mode: LeanTestChoice,
+        #[clap(long, help = "Emit output in JSON format")] 
+        json: bool,
     },
     ReadSector {
         #[clap(long)]
@@ -2180,7 +2212,8 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
         | Commands::WriteSector { path, .. }
         | Commands::RangeRead { path, .. }
         | Commands::RangeWrite { path, .. }
-        | Commands::VerifyRange { path, .. } => path.as_path(),
+        | Commands::VerifyRange { path, .. }
+        | Commands::Bench { path, .. } => path.as_path(),
     };
     if let Ok(info) = get_disk_info(initial_path_for_disk_info) {
         log_simple(&log_file_arc_opt, None, &info);
@@ -2538,6 +2571,13 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     ),
                 }
             }
+        }
+        Commands::Bench { path, mode, json } => {
+            let file_path = resolve_file_path(path, &log_file_arc_opt)?;
+            let test: LeanTest = mode.into();
+            let result = run_lean_test(&file_path, test, json)?;
+            log_simple(&log_file_arc_opt, None, result);
+            let _ = fs::remove_file(&file_path);
         }
         Commands::ReadSector {
             path,

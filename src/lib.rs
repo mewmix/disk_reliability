@@ -1,6 +1,6 @@
 use rand::{thread_rng, Rng};
 use serde_json::json;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;

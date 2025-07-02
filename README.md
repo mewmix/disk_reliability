@@ -47,11 +47,12 @@ $ install -Dm755 target/release/disk-tester /usr/local/bin/disk-tester   # Linux
 
 ## 3  CLI Overview
 
-The binary understands **six** sub‑commands (run with `--help` for the full syntax):
+The binary understands **seven** sub‑commands (run with `--help` for the full syntax):
 
 | Sub‑command    | Purpose                                                            |
 | -------------- | ------------------------------------------------------------------ |
 | `full-test`    | End‑to‑end write → read → verify of a contiguous region (default). |
+| `bench`        | Run a preset lightweight benchmark and print throughput. |
 | `read-sector`  | Dump a single logical sector to stdout/log.                        |
 | `write-sector` | Overwrite one sector with a chosen pattern.                        |
 | `range-read`   | Sequentially read a slice and optionally hex‑preview the data.     |
@@ -99,6 +100,12 @@ $ sudo ./target/release/disk-tester full-test \
 ```bash
 $ disk-tester verify-range --path /images/firmware.img \
        --start-sector 0 --end-sector 2048 --block-size 512 --data-type hex
+```
+
+### 4.4 Run a quick benchmark
+
+```bash
+$ disk-tester bench --path ./test.bin --mode seq1m-q8t1
 ```
 
 ---
