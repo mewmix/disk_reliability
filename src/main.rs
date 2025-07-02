@@ -2227,15 +2227,14 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
     }
 
     let initial_path_for_disk_info = match &cli.command {
-        Commands::FullTest { path, .. } => path
-            .as_ref()
-            .map_or_else(|| Path::new("."), |p| p.as_path()),
+        Commands::FullTest { path, .. } | Commands::Bench { path, .. } => {
+            path.as_ref().map(|p| p.as_path()).unwrap_or_else(|| Path::new("."))
+        }
         Commands::ReadSector { path, .. }
         | Commands::WriteSector { path, .. }
         | Commands::RangeRead { path, .. }
         | Commands::RangeWrite { path, .. }
-        | Commands::VerifyRange { path, .. }
-        | Commands::Bench { path, .. } => path.as_path(),
+        | Commands::VerifyRange { path, .. } => path.as_path(),
     };
     if let Ok(info) = get_disk_info(initial_path_for_disk_info) {
         log_simple(&log_file_arc_opt, None, &info);

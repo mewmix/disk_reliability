@@ -72,7 +72,7 @@ mod windows {
         handleapi::CloseHandle,
         ioapiset::DeviceIoControl,
         winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED},
-        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, HANDLE},
+        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE},
     };
 
     #[repr(C)]
