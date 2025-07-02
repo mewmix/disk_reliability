@@ -113,7 +113,7 @@ mod windows {
         unsafe {
             let handle: HANDLE = CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null_mut(),
                 3, // OPEN_EXISTING
@@ -191,11 +191,9 @@ mod windows {
     pub fn serial<P: AsRef<Path>>(dev: P) -> SerialResult<String> {
         // -------- drive-letter (D:, D:\, D:/) →  \\.\D: -------------------
         let s = dev.as_ref().display().to_string();
-        let (mut device_path, is_letter) = match s.chars().next() {
-            Some(c)
-                if c.is_ascii_alphabetic()
-                    && (s.len() == 2 || s.starts_with(":\\") || s.starts_with(":/")) =>
-            {
+        let mut chars = s.chars();
+        let (mut device_path, is_letter) = match (chars.next(), chars.next()) {
+            (Some(c), Some(':')) if c.is_ascii_alphabetic() => {
                 (format!(r"\\.\{}:", c.to_ascii_uppercase()), true)
             }
             _ => (s, false),
