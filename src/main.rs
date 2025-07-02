@@ -1916,6 +1916,8 @@ fn full_reliability_test(
                     } else {
                         format!("First mismatch at byte offset {} in batch", diff_offset)
                     };
+                    let expected_buf = msg.expected_byte.map(|b| [b]);
+                    let actual_buf = msg.actual_byte.map(|b| [b]);
                     log_error(
                         &log_f_opt,
                         Some(&pb_arc),
@@ -1923,8 +1925,8 @@ fn full_reliability_test(
                         msg.abs_start_sector,
                         "Data Mismatch",
                         &detail,
-                        None,
-                        None,
+                        expected_buf.as_ref().map(|b| b.as_slice()),
+                        actual_buf.as_ref().map(|b| b.as_slice()),
                         Some(file_path_owned.clone()),
                     );
                 }
@@ -2488,7 +2490,52 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                             .push_str(" A fatal error was also encountered during the test.");
                     }
                     log_simple(&log_file_arc_opt, None, &error_summary_msg);
+                    // Remove the test file even when errors are encountered
+                    match fs::remove_file(&file_path) {
+                        Ok(_) => log_simple(
+                            &log_file_arc_opt,
+                            None,
+                            format!(
+                                "Deleted test file '{}' after pass {}",
+                                file_path.display(),
+                                pass_idx + 1
+                            ),
+                        ),
+                        Err(e) => log_simple(
+                            &log_file_arc_opt,
+                            None,
+                            format!(
+                                "Failed to delete test file '{}' after pass {}: {}",
+                                file_path.display(),
+                                pass_idx + 1,
+                                e
+                            ),
+                        ),
+                    }
                     return Err(io::Error::new(ErrorKind::Other, error_summary_msg));
+                }
+
+                // Clean up the test file before the next iteration
+                match fs::remove_file(&file_path) {
+                    Ok(_) => log_simple(
+                        &log_file_arc_opt,
+                        None,
+                        format!(
+                            "Deleted test file '{}' after pass {}",
+                            file_path.display(),
+                            pass_idx + 1
+                        ),
+                    ),
+                    Err(e) => log_simple(
+                        &log_file_arc_opt,
+                        None,
+                        format!(
+                            "Failed to delete test file '{}' after pass {}: {}",
+                            file_path.display(),
+                            pass_idx + 1,
+                            e
+                        ),
+                    ),
                 }
             }
         }
