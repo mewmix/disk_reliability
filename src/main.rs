@@ -270,6 +270,9 @@ enum Commands {
         mode: LeanTestChoice,
         #[clap(long, help = "Emit output in JSON format")]
         json: bool,
+        #[cfg(feature = "direct")]
+        #[clap(long)]
+        direct_io: bool,
     },
     ReadSector {
         #[clap(long)]
@@ -2194,13 +2197,13 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
         path,
         mode,
         json: true,
+        direct_io,
     } = &cli.command
     {
-        let file_path = simple_resolve(path.clone());
+        let file_path = resolve_file_path(path.clone(), &log_file_arc_opt)?;
         let test: LeanTest = mode.clone().into();
-        let result = run_lean_test(&file_path, test)?;
+        let result = run_lean_test(&file_path, test, *direct_io)?;
         println!("{}", result.to_json());
-        let _ = fs::remove_file(&file_path);
         return Ok(());
     }
     log_simple(&log_file_arc_opt, None, "Starting Disk Test Tool...");
@@ -2593,10 +2596,10 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 }
             }
         }
-        Commands::Bench { path, mode, json } => {
+        Commands::Bench { path, mode, json, direct_io } => {
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
             let test: LeanTest = mode.into();
-            let result = run_lean_test(&file_path, test)?;
+            let result = run_lean_test(&file_path, test, direct_io)?;
             if json {
                 println!("{}", result.to_json());
             } else {

@@ -59,17 +59,22 @@ impl TestResult {
 /// The test writes and then reads a small amount of data using
 /// parameters derived from [`LeanTest`]. The return value is either a
 /// formatted string or a JSON string if `as_json` is `true`.
-pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest) -> io::Result<TestResult> {
+pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, direct_io: bool) -> io::Result<TestResult> {
     let (block_size, queue_depth, random, label) = test.params();
     // Use a very small footprint to keep the test quick.
     let blocks = queue_depth * 32; // 32 batches of the queue depth
     let total_bytes = (blocks * block_size) as u64;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+
+    #[cfg(feature = "direct")]
+    if direct_io {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(winapi::um::winbase::FILE_FLAG_NO_BUFFERING);
+    }
+
+    let mut file = options.open(&path)?;
     file.set_len(total_bytes)?;
 
     let mut buffer = vec![0u8; block_size];
@@ -126,7 +131,7 @@ mod tests {
     #[test]
     fn json_output() {
         let tmp = NamedTempFile::new().unwrap();
-        let result = run_lean_test(tmp.path(), LeanTest::Seq1Mq1t1).unwrap();
+        let result = run_lean_test(tmp.path(), LeanTest::Seq1Mq1t1, false).unwrap();
         let v = result.to_json();
         assert_eq!(v["label"], "SEQ1M Q1T1");
     }
