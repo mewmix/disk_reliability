@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "disk_tester"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aligned-vec",
  "cfg-if",
