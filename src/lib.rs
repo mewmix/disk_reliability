@@ -1,14 +1,17 @@
-// lib.rs:
+//! NOTE: This implementation requires the `aligned_vec` crate.
+//! Add the following to your Cargo.toml:
+//! aligned_vec = "0.5"
 
+use aligned_vec::AVec;
 use rand::{thread_rng, Rng};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, unbounded, Receiver};
 
 // Platform-specific helpers for positioned I/O
 #[cfg(unix)]
@@ -94,65 +97,85 @@ fn run_io_phase(
     is_write: bool,
     is_random: bool,
 ) -> io::Result<()> {
-    // A channel acts as our work queue. Bounded to prevent filling memory with all jobs at once.
-    let (tx, rx) = bounded::<u64>(queue_depth * 2);
+    // A channel for dispatching jobs (offsets) to workers.
+    let (job_tx, job_rx) = bounded::<u64>(queue_depth);
+    // A channel for workers to send their I/O results (or errors) back.
+    let (result_tx, result_rx) = unbounded::<io::Result<()>>();
 
     thread::scope(|s| {
         // --- Spawn Worker Threads ---
-        // Each thread represents one "in-flight" operation, so we spawn `queue_depth` of them.
         for _ in 0..queue_depth {
-            let worker_rx: Receiver<u64> = rx.clone();
+            let worker_job_rx: Receiver<u64> = job_rx.clone();
+            let worker_result_tx = result_tx.clone();
             let file_clone = file.clone();
 
             s.spawn(move || {
-                let mut buffer = vec![0u8; block_size];
+                // FIX: Allocate buffer once per thread.
+                // FIX: Use an aligned vector to meet O_DIRECT/NO_BUFFERING requirements.
+                // The API for aligned_vec changed in v0.5.
+                // 4096-byte alignment satisfies FILE_FLAG_NO_BUFFERING / O_DIRECT.
+                let mut buffer = AVec::<u8>::from_iter(
+                    4096,
+                    std::iter::repeat(0u8).take(block_size)
+                );
+
+
                 let mut rng = if is_random { Some(thread_rng()) } else { None };
 
                 // Worker loop: pull a job (offset) from the channel and process it.
-                while let Ok(offset) = worker_rx.recv() {
-                    if is_write {
+                while let Ok(offset) = worker_job_rx.recv() {
+                    let res = if is_write {
                         if let Some(ref mut rng) = rng {
                             rng.fill(&mut buffer[..]);
                         }
-                        // For sequential writes, the buffer can remain all zeros or use a fixed pattern.
-                        // Here, we just write the buffer as-is.
-                        if let Err(_e) = pwrite_all(&file_clone, &buffer, offset) {
-                           // In a real app, we'd log this error or send it back.
-                           // For this benchmark, we'll continue and let it impact performance.
-                        }
+                        pwrite_all(&file_clone, &buffer, offset)
                     } else {
-                        // Read phase
-                        if let Err(_e) = pread_exact_at(&file_clone, &mut buffer, offset) {
-                            // Similar to write, log/handle error.
-                        }
+                        pread_exact_at(&file_clone, &mut buffer, offset)
+                    };
+
+                    // FIX: Propagate errors by sending the `io::Result` back.
+                    // If send fails, the main thread has already terminated, so we can exit.
+                    if worker_result_tx.send(res).is_err() {
+                        break;
                     }
                 }
             });
         }
+
+        // Drop the main thread's sender handle so the result channel can close properly.
+        drop(result_tx);
         
         // --- Main Thread: Producer ---
-        // Drop the original receiver so the loop terminates when the producer is done.
-        drop(rx);
-        // Push all the jobs (offsets) into the work queue.
         for &offset in offsets {
-            if tx.send(offset).is_err() {
-                // This would mean all receivers have hung up, indicating a panic.
-                return Err(io::Error::new(io::ErrorKind::Other, "Worker threads terminated unexpectedly"));
+            if job_tx.send(offset).is_err() {
+                // All receivers have hung up, likely due to a worker panic.
+                // The error will be caught below when we check the result channel.
+                break;
             }
         }
-        // Drop the sender to signal that no more jobs are coming. Workers will exit their loops.
-        drop(tx);
+        // Drop the job sender to signal that no more jobs are coming. Workers will exit their loops.
+        drop(job_tx);
+
+        // --- Result Aggregation ---
+        // Collect a result for every job we dispatched.
+        for _ in 0..offsets.len() {
+            // recv() will fail if all worker threads have panicked.
+            let worker_result = result_rx.recv()
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "A worker thread panicked and disconnected"))?;
+
+            // Check the actual io::Result from the worker. The first I/O error is returned.
+            // This is equivalent to `worker_result?` but bubbles up the specific I/O error.
+            if let Err(e) = worker_result {
+                return Err(e);
+            }
+        }
 
         Ok(())
-    }) // Scope automatically joins all threads.
+    }) // Scope automatically joins all threads, ensuring all I/O is complete.
 }
 
 
 /// Execute one of the preset tests against `path`.
-///
-/// The test writes and then reads a small amount of data using
-/// parameters derived from [`LeanTest`]. The return value is either a
-/// formatted string or a JSON string if `as_json` is `true`.
 pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, direct_io: bool) -> io::Result<TestResult> {
     let (block_size, queue_depth, random, label) = test.params();
     let blocks = queue_depth * 32;
@@ -170,7 +193,8 @@ pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, direct_io: bool) -
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(winapi::um::winbase::FILE_FLAG_NO_BUFFERING);
+            const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+            options.custom_flags(FILE_FLAG_NO_BUFFERING);
         }
     }
 
@@ -198,7 +222,6 @@ pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, direct_io: bool) -
 
     // --- Read Phase ---
     let start_read = Instant::now();
-    // For random tests, we re-use the same random offsets to ensure we are reading valid locations.
     run_io_phase(&file, &offsets, block_size, queue_depth, false, random)?;
     let read_secs = start_read.elapsed().as_secs_f64();
 
@@ -232,12 +255,23 @@ mod tests {
 
     #[test]
     fn q8_runs_concurrently() {
-        // This is a smoke test to ensure Q>1 doesn't crash.
-        // A true performance test would show Q8 > Q1, but that's environment-dependent.
+        // This is a smoke test to ensure Q>1 doesn't crash and completes successfully.
         let tmp = NamedTempFile::new().unwrap();
         let result = run_lean_test(tmp.path(), LeanTest::Rnd4kQ32T1, false).unwrap();
         let v = result.to_json();
         assert_eq!(v["label"], "RND4K Q32T1");
         assert!(v["read_mib_s"].as_f64().unwrap() > 0.0);
+    }
+
+    // This test will only run on Unix-like systems and requires root or specific capabilities
+    // to succeed on some systems, but it serves to validate that O_DIRECT doesn't fail
+    // due to alignment issues. We wrap it in a feature flag to avoid breaking CI.
+    #[test]
+    #[cfg_attr(not(feature = "direct_io_test"), ignore)]
+    fn o_direct_succeeds_with_alignment() {
+        let tmp = NamedTempFile::new().unwrap();
+        // This will panic if the aligned allocation or I/O fails.
+        let result = run_lean_test(tmp.path(), LeanTest::Rnd4kQ1t1, true).unwrap();
+        assert_eq!(result.label, "RND4K Q1T1");
     }
 }
