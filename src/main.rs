@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 
 // Standard library imports
 use std::cmp;
@@ -601,40 +602,22 @@ fn open_file_options(
         {
             #[cfg(target_os = "linux")]
             {
-                log_simple(
-                    _log_f,
-                    None,
-                    "Using O_DIRECT on Linux. Ensure buffer/IO alignment and block size multiple of 512B.",
-                );
+                // This message is now logged only once in main_logic to avoid spamming from multiple threads
                 opts.custom_flags(libc::O_DIRECT);
             }
             #[cfg(target_os = "windows")]
             {
-                log_simple(
-                    _log_f,
-                    None,
-                    "Using FILE_FLAG_NO_BUFFERING on Windows. Ensure sector alignment and block size multiple of 512B.",
-                );
                 opts.custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH);
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
-                log_simple(
-                    _log_f,
-                    None,
-                    "Direct I/O requested but not supported on this platform. Ignored.",
-                );
+                // No action, message logged in main_logic
             }
         }
         #[cfg(not(feature = "direct"))]
         {
             // Suppress unused variable warning if direct_io is always false
             let _ = direct_io;
-            log_simple(
-                _log_f,
-                None,
-                "Direct I/O not enabled in this build. Using standard buffered I/O.",
-            );
         }
     }
 
@@ -1420,6 +1403,15 @@ fn preallocate_file(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>) ->
     preallocate_file_os(file, size, log_f)
 }
 
+#[inline]
+fn mib_s(bytes: u64, secs: f64) -> f64 {
+    if secs > 0.0 {
+        (bytes as f64 / 1_048_576.0) / secs
+    } else {
+        0.0
+    }
+}
+
 fn full_reliability_test(
     file_path: &Path,
     log_f_opt: &Option<Arc<Mutex<File>>>,
@@ -2083,8 +2075,10 @@ fn full_reliability_test(
             expected_byte: Option<u8>,
             actual_byte: Option<u8>,
             io_error: Option<io::Error>,
-            write_secs: f64,
-            read_secs: f64,
+            write_secs_first: f64,
+            read_secs_first: f64,
+            write_secs_second: f64,
+            read_secs_second: f64,
             buf: AlignedVec<u8>,
         }
 
@@ -2132,23 +2126,55 @@ fn full_reliability_test(
                         let byte_len = sector_count * block_size_usize;
                         let byte_offs = abs_start_sector * block_size_u64;
 
-                        let w_start = Instant::now();
-                        let w_res = f
-                            .seek(SeekFrom::Start(byte_offs))
-                            .and_then(|_| f.write_all(&buf[..byte_len]));
-                        let write_secs = w_start.elapsed().as_secs_f64();
+                        let (
+                            io_res,
+                            write_secs_first,
+                            read_secs_first,
+                            write_secs_second,
+                            read_secs_second,
+                        ) = if dual_pattern {
+                            let split = sector_count / 2;
+                            let first_len = split * block_size_usize;
 
-                        let (r_res, read_secs) = if w_res.is_ok() {
-                            let r_start = Instant::now();
-                            let res = f
+                            let w0 = Instant::now();
+                            let wr = f.seek(SeekFrom::Start(byte_offs)).and_then(|_| f.write_all(&buf[..first_len]));
+                            let wsf = w0.elapsed().as_secs_f64();
+
+                            let w1 = Instant::now();
+                            let wr2 = f.write_all(&buf[first_len..byte_len]);
+                            let wss = w1.elapsed().as_secs_f64();
+                            let write_res = wr.and(wr2);
+
+                            let r0 = Instant::now();
+                            let rd = f
                                 .seek(SeekFrom::Start(byte_offs))
-                                .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
-                            (res, r_start.elapsed().as_secs_f64())
+                                .and_then(|_| f.read_exact(&mut read_buf[..first_len]));
+                            let rsf = r0.elapsed().as_secs_f64();
+
+                            let r1 = Instant::now();
+                            let rd2 = f.read_exact(&mut read_buf[first_len..byte_len]);
+                            let rss = r1.elapsed().as_secs_f64();
+                            
+                            (write_res.and(rd).and(rd2), wsf, rsf, wss, rss)
                         } else {
-                            (Ok(()), 0.0)
+                            let w_start = Instant::now();
+                            let w_res = f
+                                .seek(SeekFrom::Start(byte_offs))
+                                .and_then(|_| f.write_all(&buf[..byte_len]));
+                            let write_secs = w_start.elapsed().as_secs_f64();
+
+                            let (r_res, read_secs) = if w_res.is_ok() {
+                                let r_start = Instant::now();
+                                let res = f
+                                    .seek(SeekFrom::Start(byte_offs))
+                                    .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
+                                (res, r_start.elapsed().as_secs_f64())
+                            } else {
+                                (Ok(()), 0.0)
+                            };
+                            (w_res.and(r_res), write_secs, read_secs, 0.0, 0.0)
                         };
 
-                        let io_res = w_res.and(r_res);
                         let mut diff = None;
                         let mut expected_b = None;
                         let mut actual_b = None;
@@ -2173,8 +2199,10 @@ fn full_reliability_test(
                             expected_byte: expected_b,
                             actual_byte: actual_b,
                             io_error: io_res.err(),
-                            write_secs,
-                            read_secs,
+                            write_secs_first,
+                            read_secs_first,
+                            write_secs_second,
+                            read_secs_second,
                             buf,
                         });
                     } else {
@@ -2244,41 +2272,52 @@ fn full_reliability_test(
                 Ok(msg) => {
                     jobs_in_flight -= 1;
                     pb_arc.inc(msg.sector_count as u64);
-
+                    
                     let batch_bytes = msg.sector_count as u64 * block_size_u64;
-                    let write_mib = if msg.write_secs > 0.0 {
-                        (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs
-                    } else {
-                        0.0
-                    };
-                    let read_mib = if msg.read_secs > 0.0 {
-                        (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs
-                    } else {
-                        0.0
-                    };
-                    let base_label = match &*data_pattern_arc {
-                        DataTypePattern::Hex => "hex",
-                        DataTypePattern::Text => "text",
-                        DataTypePattern::Binary => "binary",
-                        DataTypePattern::File(_) => "file",
-                        DataTypePattern::Random => "random",
-                    };
-                    let pattern_label = if dual_pattern { "dual" } else { base_label };
+                    let (off_start_val, off_start_unit) = format_bytes_int(msg.abs_start_sector * block_size_u64);
+                    let (off_end_val, off_end_unit) = format_bytes_int((msg.abs_start_sector + msg.sector_count as u64) * block_size_u64);
+                    let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
+                    let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
 
-                    log_simple(
-                        &log_f_opt,
-                        Some(&pb_arc),
-                        format!(
-                            "offset {}..{}: batch {}/{} ({})  {:.0} MiB/s W, {:.0} MiB/s R",
-                            format_bytes_int(msg.abs_start_sector * block_size_u64).0,
-                            format_bytes_int((msg.abs_start_sector + msg.sector_count as u64) * block_size_u64).0,
-                            format_bytes_int(batch_bytes).0,
-                            format_bytes_int(block_size_u64).0,
-                            pattern_label,
-                            write_mib,
-                            read_mib,
-                        ),
-                    );
+                    if dual_pattern {
+                        let first_bytes = (msg.sector_count as usize / 2) as u64 * block_size_u64;
+                        let second_bytes = batch_bytes - first_bytes;
+                        let w0 = mib_s(first_bytes, msg.write_secs_first);
+                        let r0 = mib_s(first_bytes, msg.read_secs_first);
+                        let w1 = mib_s(second_bytes, msg.write_secs_second);
+                        let r1 = mib_s(second_bytes, msg.read_secs_second);
+                        log_simple(
+                            &log_f_opt,
+                            Some(&pb_arc),
+                            format!(
+                                "{off_start_val} {off_start_unit} - \
+                                {off_end_val} {off_end_unit}: \
+                                {batch_val} {batch_unit}/{buf_val} {buf_unit} (dual)  \
+                                binary {w0:.0} MiB/sec … {r0:.0} MiB/sec | \
+                                random {w1:.0} MiB/sec … {r1:.0} MiB/sec"
+                            )
+                        );
+                    } else {
+                        let w0 = mib_s(batch_bytes, msg.write_secs_first);
+                        let r0 = mib_s(batch_bytes, msg.read_secs_first);
+                        let base_label = match &*data_pattern_arc {
+                            DataTypePattern::Hex => "hex",
+                            DataTypePattern::Text => "text",
+                            DataTypePattern::Binary => "binary",
+                            DataTypePattern::File(_) => "file",
+                            DataTypePattern::Random => "random",
+                        };
+                        log_simple(
+                            &log_f_opt,
+                            Some(&pb_arc),
+                            format!(
+                                "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec W, {:.0} MiB/s R",
+                                base_label,
+                                w0,
+                                r0,
+                            ),
+                        );
+                    }
 
                     if let Some(e) = msg.io_error {
                         counters_arc.increment_write_errors();
@@ -2750,11 +2789,6 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 log_simple(
                     &log_file_arc_opt,
                     None,
-                    format!("Direct I/O: {}", use_direct_io),
-                );
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
                     format!("Preallocate: {}", preallocate),
                 );
                 log_simple(
@@ -2762,6 +2796,21 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     None,
                     format!("Deferred Verify: {}", deferred_verify),
                 );
+            }
+            if use_direct_io {
+                #[cfg(feature = "direct")]
+                {
+                    #[cfg(target_os = "linux")]
+                    log_simple(&log_file_arc_opt, None, "Direct I/O Mode: O_DIRECT (Linux)");
+                    #[cfg(target_os = "windows")]
+                    log_simple(&log_file_arc_opt, None, "Direct I/O Mode: FILE_FLAG_NO_BUFFERING (Windows)");
+                    #[cfg(target_os = "macos")]
+                    log_simple(&log_file_arc_opt, None, "Direct I/O Mode: F_NOCACHE (macOS)");
+                    #[cfg(not(any(target_os="linux", target_os="windows", target_os="macos")))]
+                    log_simple(&log_file_arc_opt, None, "Direct I/O requested but not supported on this OS. Ignored.");
+                }
+                #[cfg(not(feature = "direct"))]
+                log_simple(&log_file_arc_opt, None, "Direct I/O not enabled in this build. Using standard buffered I/O.");
             }
 
             let pattern = match data_type {
