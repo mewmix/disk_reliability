@@ -100,8 +100,8 @@ enum LeanTestChoice {
     Seq1Mq8t1,
     #[clap(name = "seq1m-q1t1", help = "Sequential 1MiB blocks, single queue")]
     Seq1Mq1t1,
-    #[clap(name = "rnd4k-q32t16", help = "Random 4KiB blocks, QD32, 16 threads")]
-    Rnd4kQ32T16,
+    #[clap(name = "rnd4k-q32t1", help = "Random 4KiB blocks, QD32, 1 threads")]
+    Rnd4kQ32T1,
     #[clap(name = "rnd4k-q1t1", help = "Random 4KiB blocks, single queue")]
     Rnd4kQ1t1,
 }
@@ -111,7 +111,7 @@ impl From<LeanTestChoice> for disk_tester::LeanTest {
         match c {
             LeanTestChoice::Seq1Mq8t1 => disk_tester::LeanTest::Seq1Mq8t1,
             LeanTestChoice::Seq1Mq1t1 => disk_tester::LeanTest::Seq1Mq1t1,
-            LeanTestChoice::Rnd4kQ32T16 => disk_tester::LeanTest::Rnd4kQ32T16,
+            LeanTestChoice::Rnd4kQ32T1 => disk_tester::LeanTest::Rnd4kQ32T1,
             LeanTestChoice::Rnd4kQ1t1 => disk_tester::LeanTest::Rnd4kQ1t1,
         }
     }
