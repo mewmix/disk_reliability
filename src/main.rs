@@ -1,4 +1,3 @@
-#![allow(clippy::too_many_arguments)]
 
 // Standard library imports
 use std::cmp;
@@ -238,8 +237,18 @@ enum Commands {
         resume_from_sector: u64,
         #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")]
         block_size: u64,
-        #[clap(long, default_value_t = 1)]
+        #[clap(
+            long,
+            default_value_t = 1,
+            help = "Number of parallel I/O worker threads."
+        )]
         threads: usize,
+        #[clap(
+            long,
+            default_value_t = 32,
+            help = "Number of I/O batches to queue ahead (per-thread queue depth)."
+        )]
+        queue_depth: usize,
         #[clap(long, value_parser = parse_size_with_suffix, default_value = "1M", help = "Total batch size for I/O operations (e.g., 4M, 256K).")]
         batch_size: u64,
         #[clap(long, value_enum, default_value = "binary")]
@@ -256,6 +265,11 @@ enum Commands {
             help = "Alternate between random and sequential patterns during writes"
         )]
         dual_pattern: bool,
+        #[clap(
+            long,
+            help = "Verify data in a separate pass after all writes are complete, instead of immediately after each write."
+        )]
+        deferred_verify: bool,
         #[clap(
             long,
             default_value_t = 1,
@@ -1413,12 +1427,14 @@ fn full_reliability_test(
     user_specified_test_size: Option<u64>,
     resume_from_sector: u64, // Absolute sector in file to start test operations
     block_size_u64: u64,
-    _num_threads: usize,
+    num_threads: usize,
+    queue_depth: usize,
     data_pattern: DataTypePattern,
     batch_size_sectors: usize,
     direct_io: bool,
     preallocate: bool,
     dual_pattern: bool,
+    deferred_verify: bool,
     _verbose: bool,
 ) -> io::Result<()> {
     let block_size_usize = block_size_u64 as usize;
@@ -1573,27 +1589,489 @@ fn full_reliability_test(
     );
 
     let start_time = Instant::now();
-    let pb = ProgressBar::new(total_sectors_in_test_run);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) {wide_msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-    let pb_arc = Arc::new(pb);
     let data_pattern_arc = Arc::new(data_pattern);
     let file_path_owned = file_path.to_path_buf();
 
-    {
-        // ---------------------------------------------------------------
-        // 1. A single worker thread that handles the blocking system-calls
-        // ---------------------------------------------------------------
+    // The main test logic is now split based on the verification strategy
+    if deferred_verify {
+        // ===============================================================
+        // DEFERRED VERIFICATION: Write Pass -> Verify Pass
+        // ===============================================================
+        log_simple(log_f_opt, None, "--- Starting Write Pass ---");
+
+        // --- WRITE PASS ---
+        {
+            let pb = ProgressBar::new(total_sectors_in_test_run);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "Writing [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) {wide_msg}",
+                )
+                .unwrap()
+                .progress_chars("##-"),
+            );
+            let pb_arc = Arc::new(pb);
+
+            enum WriteJob {
+                Write {
+                    abs_start_sector: u64,
+                    sector_count: usize,
+                    buf: AlignedVec<u8>,
+                },
+                Terminate,
+            }
+            struct WriteResult {
+                abs_start_sector: u64,
+                sector_count: u32,
+                io_error: Option<io::Error>,
+                write_secs: f64,
+                buf: AlignedVec<u8>,
+            }
+
+            let (req_tx, req_rx) = bounded::<WriteJob>(queue_depth);
+            let (res_tx, res_rx) = bounded::<WriteResult>(queue_depth);
+
+            let mut workers = Vec::with_capacity(num_threads);
+            for i in 0..num_threads {
+                let worker_file_path = file_path_owned.clone();
+                let worker_log = log_f_opt.clone();
+                let worker_pb_arc = pb_arc.clone();
+                let thread_req_rx = req_rx.clone();
+                let thread_res_tx = res_tx.clone();
+
+                workers.push(thread::spawn(move || {
+                    let mut f = match open_file(
+                        &worker_file_path,
+                        false,
+                        true,
+                        false,
+                        direct_io,
+                        &worker_log,
+                    ) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            log_simple(
+                                &worker_log,
+                                Some(&worker_pb_arc),
+                                format!("[Thread {}] Cannot open test file for writing: {}", i, e),
+                            );
+                            HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+
+                    for job in thread_req_rx.iter() {
+                        match job {
+                            WriteJob::Terminate => break,
+                            WriteJob::Write {
+                                abs_start_sector,
+                                sector_count,
+                                buf,
+                            } => {
+                                let byte_len = sector_count * block_size_usize;
+                                let byte_offs = abs_start_sector * block_size_u64;
+
+                                let w_start = Instant::now();
+                                let io_res = f
+                                    .seek(SeekFrom::Start(byte_offs))
+                                    .and_then(|_| f.write_all(&buf[..byte_len]));
+                                let write_secs = w_start.elapsed().as_secs_f64();
+
+                                let _ = thread_res_tx.send(WriteResult {
+                                    abs_start_sector,
+                                    sector_count: sector_count as u32,
+                                    io_error: io_res.err(),
+                                    write_secs,
+                                    buf,
+                                });
+                            }
+                        }
+                    }
+                }));
+            }
+            drop(req_rx); // Drop original rx, workers have clones.
+
+            // Producer/Consumer on main thread
+            let mut buffer_pool: Vec<_> = (0..queue_depth.max(2))
+                .map(|_| alloc_buffer(batch_size_sectors * block_size_usize, direct_io))
+                .collect();
+            let mut pattern_tile = alloc_buffer(block_size_usize, false);
+
+            let mut global_sector_cursor = 0u64;
+            let mut jobs_in_flight = 0;
+
+            'write_loop: loop {
+                while global_sector_cursor < total_sectors_in_test_run {
+                    if let Some(mut target_buf) = buffer_pool.pop() {
+                        let remaining = total_sectors_in_test_run - global_sector_cursor;
+                        let this_batch_sectors =
+                            cmp::min(batch_size_sectors as u64, remaining) as usize;
+                        let abs_first_sector = resume_from_sector + global_sector_cursor;
+
+                        let split_point = this_batch_sectors / 2;
+                        for i in 0..this_batch_sectors {
+                            let current_abs_sector = abs_first_sector + i as u64;
+                            if dual_pattern && i >= split_point {
+                                DataTypePattern::Random
+                                    .fill_block_inplace(&mut pattern_tile, current_abs_sector);
+                            } else {
+                                data_pattern_arc
+                                    .fill_block_inplace(&mut pattern_tile, current_abs_sector);
+                            }
+                            let start = i * block_size_usize;
+                            target_buf[start..start + block_size_usize]
+                                .copy_from_slice(&pattern_tile);
+                        }
+
+                        if req_tx
+                            .send(WriteJob::Write {
+                                abs_start_sector: abs_first_sector,
+                                sector_count: this_batch_sectors,
+                                buf: target_buf,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+
+                        jobs_in_flight += 1;
+                        global_sector_cursor += this_batch_sectors as u64;
+                    } else {
+                        break;
+                    }
+                }
+
+                if jobs_in_flight == 0 && global_sector_cursor >= total_sectors_in_test_run {
+                    break 'write_loop;
+                }
+                if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+                    break 'write_loop;
+                }
+
+                match res_rx.recv() {
+                    Ok(msg) => {
+                        jobs_in_flight -= 1;
+                        pb_arc.inc(msg.sector_count as u64);
+
+                        if let Some(e) = msg.io_error {
+                            counters_arc.increment_write_errors();
+                            log_error(
+                                &log_f_opt,
+                                Some(&pb_arc),
+                                0,
+                                msg.abs_start_sector,
+                                "Write Error",
+                                &e.to_string(),
+                                None,
+                                None,
+                                Some(file_path_owned.clone()),
+                            );
+                        }
+
+                        buffer_pool.push(msg.buf);
+                    }
+                    Err(_) => {
+                        if jobs_in_flight > 0 {
+                            log_simple(
+                                log_f_opt,
+                                Some(&pb_arc),
+                                "Result channel closed; workers may have panicked.",
+                            );
+                            HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                        }
+                        break 'write_loop;
+                    }
+                }
+            }
+
+            // Graceful shutdown
+            for _ in 0..num_threads {
+                req_tx.send(WriteJob::Terminate).ok();
+            }
+            drop(req_tx);
+            // Drain any remaining results
+            while let Ok(msg) = res_rx.try_recv() {
+                pb_arc.inc(msg.sector_count as u64);
+                buffer_pool.push(msg.buf);
+            }
+            for handle in workers {
+                handle.join().expect("write worker thread panicked");
+            }
+
+            if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+                pb_arc.abandon_with_message("Write pass aborted.");
+            } else {
+                pb_arc.finish_with_message("Write pass complete.");
+            }
+        }
+
+        // Abort if write pass had errors
+        if HAS_FATAL_ERROR.load(Ordering::SeqCst)
+            || counters_arc.write_errors.load(Ordering::Relaxed) > 0
+        {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "Test aborted due to errors in write pass.",
+            ));
+        }
+
+        log_simple(log_f_opt, None, "--- Starting Verify Pass ---");
+        // --- VERIFY PASS ---
+        {
+            let pb = ProgressBar::new(total_sectors_in_test_run);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "Verifying [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) Mismatches: {msg}",
+                )
+                .unwrap()
+                .progress_chars("##-"),
+            );
+            pb.set_message("0");
+            let pb_arc = Arc::new(pb);
+
+            enum VerifyJob {
+                Verify {
+                    abs_start_sector: u64,
+                    sector_count: usize,
+                },
+                Terminate,
+            }
+            struct VerifyResult {
+                abs_start_sector: u64,
+                sector_count: u32,
+                diff: Option<u32>,
+                expected_byte: Option<u8>,
+                actual_byte: Option<u8>,
+                io_error: Option<io::Error>,
+            }
+
+            let (req_tx, req_rx) = bounded::<VerifyJob>(queue_depth);
+            let (res_tx, res_rx) = bounded::<VerifyResult>(queue_depth);
+            let mut workers = Vec::with_capacity(num_threads);
+            for i in 0..num_threads {
+                let worker_file_path = file_path_owned.clone();
+                let worker_log = log_f_opt.clone();
+                let worker_pb_arc = pb_arc.clone();
+                let thread_req_rx = req_rx.clone();
+                let thread_res_tx = res_tx.clone();
+                let thread_data_pattern_arc = data_pattern_arc.clone();
+
+                workers.push(thread::spawn(move || {
+                    let mut f = match open_file(
+                        &worker_file_path,
+                        true,
+                        false,
+                        false,
+                        direct_io,
+                        &worker_log,
+                    ) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            log_simple(
+                                &worker_log,
+                                Some(&worker_pb_arc),
+                                format!("[Thread {}] Cannot open test file for reading: {}", i, e),
+                            );
+                            HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+
+                    let mut read_buf =
+                        alloc_buffer(batch_size_sectors * block_size_usize, direct_io);
+                    let mut expected_buf =
+                        alloc_buffer(batch_size_sectors * block_size_usize, false);
+                    let mut pattern_tile = alloc_buffer(block_size_usize, false);
+
+                    for job in thread_req_rx.iter() {
+                        match job {
+                            VerifyJob::Terminate => break,
+                            VerifyJob::Verify {
+                                abs_start_sector,
+                                sector_count,
+                            } => {
+                                let byte_len = sector_count * block_size_usize;
+                                let byte_offs = abs_start_sector * block_size_u64;
+
+                                let io_res = f
+                                    .seek(SeekFrom::Start(byte_offs))
+                                    .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
+
+                                let mut diff = None;
+                                let mut expected_b = None;
+                                let mut actual_b = None;
+
+                                if io_res.is_ok() {
+                                    // Regenerate expected pattern for this batch
+                                    let split_point = sector_count / 2;
+                                    for i in 0..sector_count {
+                                        let current_abs_sector = abs_start_sector + i as u64;
+                                        if dual_pattern && i >= split_point {
+                                            DataTypePattern::Random.fill_block_inplace(
+                                                &mut pattern_tile,
+                                                current_abs_sector,
+                                            );
+                                        } else {
+                                            thread_data_pattern_arc.fill_block_inplace(
+                                                &mut pattern_tile,
+                                                current_abs_sector,
+                                            );
+                                        }
+                                        let start = i * block_size_usize;
+                                        expected_buf[start..start + block_size_usize]
+                                            .copy_from_slice(&pattern_tile);
+                                    }
+
+                                    if expected_buf[..byte_len] != read_buf[..byte_len] {
+                                        if let Some(idx) = expected_buf
+                                            .iter()
+                                            .zip(&read_buf[..byte_len])
+                                            .position(|(a, b)| a != b)
+                                        {
+                                            diff = Some(idx as u32);
+                                            expected_b = Some(expected_buf[idx]);
+                                            actual_b = Some(read_buf[idx]);
+                                        }
+                                    }
+                                }
+
+                                let _ = thread_res_tx.send(VerifyResult {
+                                    abs_start_sector,
+                                    sector_count: sector_count as u32,
+                                    diff,
+                                    expected_byte: expected_b,
+                                    actual_byte: actual_b,
+                                    io_error: io_res.err(),
+                                });
+                            }
+                        }
+                    }
+                }));
+            }
+            drop(req_rx);
+
+            let mut global_sector_cursor = 0u64;
+            let mut jobs_in_flight = 0;
+            let mut local_mismatches = 0;
+
+            'verify_loop: loop {
+                while jobs_in_flight < queue_depth
+                    && global_sector_cursor < total_sectors_in_test_run
+                {
+                    let remaining = total_sectors_in_test_run - global_sector_cursor;
+                    let this_batch_sectors =
+                        cmp::min(batch_size_sectors as u64, remaining) as usize;
+                    let abs_first_sector = resume_from_sector + global_sector_cursor;
+
+                    if req_tx
+                        .send(VerifyJob::Verify {
+                            abs_start_sector: abs_first_sector,
+                            sector_count: this_batch_sectors,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    jobs_in_flight += 1;
+                    global_sector_cursor += this_batch_sectors as u64;
+                }
+
+                if jobs_in_flight == 0 && global_sector_cursor >= total_sectors_in_test_run {
+                    break 'verify_loop;
+                }
+                if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+                    break 'verify_loop;
+                }
+
+                match res_rx.recv() {
+                    Ok(msg) => {
+                        jobs_in_flight -= 1;
+                        pb_arc.inc(msg.sector_count as u64);
+                        if let Some(e) = msg.io_error {
+                            counters_arc.increment_read_errors();
+                            log_error(
+                                &log_f_opt,
+                                Some(&pb_arc),
+                                0,
+                                msg.abs_start_sector,
+                                "Read Error",
+                                &e.to_string(),
+                                None,
+                                None,
+                                Some(file_path_owned.clone()),
+                            );
+                        } else if let Some(diff_offset) = msg.diff {
+                            local_mismatches += 1;
+                            counters_arc.increment_mismatches();
+                            let detail = if let (Some(exp_b), Some(act_b)) =
+                                (msg.expected_byte, msg.actual_byte)
+                            {
+                                format!(
+                                "First mismatch at byte offset {} in batch (wrote {:02X} vs read {:02X})",
+                                diff_offset, exp_b, act_b
+                            )
+                            } else {
+                                format!("First mismatch at byte offset {} in batch", diff_offset)
+                            };
+                            log_error(
+                                &log_f_opt,
+                                Some(&pb_arc),
+                                0,
+                                msg.abs_start_sector,
+                                "Data Mismatch",
+                                &detail,
+                                msg.expected_byte.as_ref().map(|b| std::slice::from_ref(b)),
+                                msg.actual_byte.as_ref().map(|b| std::slice::from_ref(b)),
+                                Some(file_path_owned.clone()),
+                            );
+                            pb_arc.set_message(format!("{}", local_mismatches));
+                        }
+                    }
+                    Err(_) => break 'verify_loop,
+                }
+            }
+
+            for _ in 0..num_threads {
+                req_tx.send(VerifyJob::Terminate).ok();
+            }
+            drop(req_tx);
+            while let Ok(msg) = res_rx.try_recv() {
+                pb_arc.inc(msg.sector_count as u64);
+            }
+            for handle in workers {
+                handle.join().expect("verify worker thread panicked");
+            }
+
+            if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+                pb_arc.abandon_with_message(format!(
+                    "Verify pass aborted. Mismatches found: {}",
+                    local_mismatches
+                ));
+            } else {
+                pb_arc.finish_with_message(format!(
+                    "Verify pass complete. Mismatches found: {}",
+                    local_mismatches
+                ));
+            }
+        }
+    } else {
+        // ===============================================================
+        // IMMEDIATE VERIFICATION: Write -> Read -> Verify in one loop
+        // ===============================================================
+        let pb = ProgressBar::new(total_sectors_in_test_run);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        let pb_arc = Arc::new(pb);
+
         enum IoJob {
             WriteReadVerify {
-                abs_start_sector: u64, // absolute sector in the file
-                sector_count: usize,   // how many sectors inside this batch
-                buf: AlignedVec<u8>,   // filled with the pattern
+                abs_start_sector: u64,
+                sector_count: usize,
+                buf: AlignedVec<u8>,
             },
             Terminate,
         }
@@ -1601,123 +2079,76 @@ fn full_reliability_test(
         struct IoResultMsg {
             abs_start_sector: u64,
             sector_count: u32,
-            diff: Option<u32>, // offset-in-block if mismatch, else None
+            diff: Option<u32>,
             expected_byte: Option<u8>,
             actual_byte: Option<u8>,
             io_error: Option<io::Error>,
-            write_secs_first: f64,
-            read_secs_first: f64,
-            write_secs_second: f64,
-            read_secs_second: f64,
-            buf: AlignedVec<u8>, // The buffer is returned for reuse
+            write_secs: f64,
+            read_secs: f64,
+            buf: AlignedVec<u8>,
         }
 
-        // two slots are enough for ping-pong
-        let (req_tx, req_rx): (Sender<IoJob>, Receiver<IoJob>) = bounded(2);
-        let (res_tx, res_rx): (Sender<IoResultMsg>, Receiver<IoResultMsg>) = bounded(2);
+        let (req_tx, req_rx) = bounded::<IoJob>(queue_depth);
+        let (res_tx, res_rx) = bounded::<IoResultMsg>(queue_depth);
 
-        // Clone everything the worker needs.
-        let worker_file_path = file_path_owned.clone();
-        let worker_log = log_f_opt.clone();
-        let worker_pb_arc = pb_arc.clone();
+        let mut workers = Vec::with_capacity(num_threads);
+        for i in 0..num_threads {
+            let worker_file_path = file_path_owned.clone();
+            let worker_log = log_f_opt.clone();
+            let worker_pb_arc = pb_arc.clone();
+            let thread_req_rx = req_rx.clone();
+            let thread_res_tx = res_tx.clone();
 
-        let worker = thread::spawn(move || {
-            // Open once – sequential access, O_DIRECT optionally.
-            let mut f =
-                match open_file(&worker_file_path, true, true, false, direct_io, &worker_log) {
+            workers.push(thread::spawn(move || {
+                let mut f = match open_file(
+                    &worker_file_path,
+                    true,
+                    true,
+                    false,
+                    direct_io,
+                    &worker_log,
+                ) {
                     Ok(fd) => fd,
                     Err(e) => {
                         log_simple(
                             &worker_log,
                             Some(&worker_pb_arc),
-                            format!("Worker thread cannot open test file: {}", e),
+                            format!("[Thread {}] Cannot open test file: {}", i, e),
                         );
                         HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
                         return;
                     }
                 };
+                let mut read_buf =
+                    alloc_buffer(batch_size_sectors * block_size_usize, direct_io);
 
-            // This worker thread owns the read buffer.
-            // It's sized to the max batch size and reused for every read.
-            let mut read_buf = alloc_buffer(batch_size_sectors * block_size_usize, direct_io);
-
-            // Main worker loop
-            for job in req_rx.iter() {
-                match job {
-                    IoJob::Terminate => break,
-                    IoJob::WriteReadVerify {
+                for job in thread_req_rx.iter() {
+                    if let IoJob::WriteReadVerify {
                         abs_start_sector,
                         sector_count,
                         buf,
-                    } => {
+                    } = job
+                    {
                         let byte_len = sector_count * block_size_usize;
                         let byte_offs = abs_start_sector * block_size_u64;
 
-                        let mut write_secs_first = 0.0f64;
-                        let mut read_secs_first = 0.0f64;
-                        let mut write_secs_second = 0.0f64;
-                        let mut read_secs_second = 0.0f64;
+                        let w_start = Instant::now();
+                        let w_res = f
+                            .seek(SeekFrom::Start(byte_offs))
+                            .and_then(|_| f.write_all(&buf[..byte_len]));
+                        let write_secs = w_start.elapsed().as_secs_f64();
 
-                        let seek_res = f.seek(SeekFrom::Start(byte_offs));
-                        let io_res = if let Err(e) = seek_res {
-                            Err(e)
+                        let (r_res, read_secs) = if w_res.is_ok() {
+                            let r_start = Instant::now();
+                            let res = f
+                                .seek(SeekFrom::Start(byte_offs))
+                                .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
+                            (res, r_start.elapsed().as_secs_f64())
                         } else {
-                            if dual_pattern {
-                                let split = sector_count / 2;
-                                let first_len = split * block_size_usize;
-                                // Remaining bytes for the random half
-
-                                let w_start = Instant::now();
-                                let w_res = f.write_all(&buf[..first_len]);
-                                write_secs_first = w_start.elapsed().as_secs_f64();
-                                if let Err(e) = w_res {
-                                    Err(e)
-                                } else {
-                                    let w_start2 = Instant::now();
-                                    let w_res2 = f.write_all(&buf[first_len..byte_len]);
-                                    write_secs_second = w_start2.elapsed().as_secs_f64();
-                                    if let Err(e) = w_res2 {
-                                        Err(e)
-                                    } else {
-                                        let seek_res2 = f.seek(SeekFrom::Start(byte_offs));
-                                        if let Err(e) = seek_res2 {
-                                            Err(e)
-                                        } else {
-                                            let r_start = Instant::now();
-                                            let r_res = f.read_exact(&mut read_buf[..first_len]);
-                                            read_secs_first = r_start.elapsed().as_secs_f64();
-                                            if let Err(e) = r_res {
-                                                Err(e)
-                                            } else {
-                                                let r_start2 = Instant::now();
-                                                let r_res2 = f
-                                                    .read_exact(&mut read_buf[first_len..byte_len]);
-                                                read_secs_second = r_start2.elapsed().as_secs_f64();
-                                                r_res2
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                let w_start = Instant::now();
-                                let w_res = f.write_all(&buf[..byte_len]);
-                                write_secs_first = w_start.elapsed().as_secs_f64();
-                                if w_res.is_err() {
-                                    w_res
-                                } else {
-                                    let seek_res2 = f.seek(SeekFrom::Start(byte_offs));
-                                    if let Err(e) = seek_res2 {
-                                        Err(e)
-                                    } else {
-                                        let r_start = Instant::now();
-                                        let r_res = f.read_exact(&mut read_buf[..byte_len]);
-                                        read_secs_first = r_start.elapsed().as_secs_f64();
-                                        r_res
-                                    }
-                                }
-                            }
+                            (Ok(()), 0.0)
                         };
 
+                        let io_res = w_res.and(r_res);
                         let mut diff = None;
                         let mut expected_b = None;
                         let mut actual_b = None;
@@ -1735,265 +2166,168 @@ fn full_reliability_test(
                             }
                         }
 
-                        // Ship the result (and the write buffer) back
-                        let _ = res_tx.send(IoResultMsg {
+                        let _ = thread_res_tx.send(IoResultMsg {
                             abs_start_sector,
                             sector_count: sector_count as u32,
                             diff,
                             expected_byte: expected_b,
                             actual_byte: actual_b,
                             io_error: io_res.err(),
-                            write_secs_first,
-                            read_secs_first,
-                            write_secs_second,
-                            read_secs_second,
-                            buf, // return the buffer for reuse
+                            write_secs,
+                            read_secs,
+                            buf,
                         });
+                    } else {
+                        break;
                     }
                 }
-            }
-        });
+            }));
+        }
+        drop(req_rx);
 
-        // ---------------------------------------------------------------
-        // 2. The producing / verifying side – stays in the *main* thread
-        // ---------------------------------------------------------------
-        //
-        // Buffer pool for zero-copy buffer management
-        let mut buffer_pool = vec![
-            alloc_buffer(batch_size_sectors * block_size_usize, direct_io),
-            alloc_buffer(batch_size_sectors * block_size_usize, direct_io),
-        ];
-
+        let mut buffer_pool: Vec<_> = (0..queue_depth.max(2))
+            .map(|_| alloc_buffer(batch_size_sectors * block_size_usize, direct_io))
+            .collect();
+        let mut pattern_tile = alloc_buffer(block_size_usize, false);
         let mut global_sector_cursor = 0u64;
         let mut jobs_in_flight = 0;
 
-        'main_loop: loop {
-            // First, try to submit a new job if we have a free buffer and work to do.
-            if global_sector_cursor < total_sectors_in_test_run {
+        'immediate_loop: loop {
+            while global_sector_cursor < total_sectors_in_test_run {
                 if let Some(mut target_buf) = buffer_pool.pop() {
                     let remaining = total_sectors_in_test_run - global_sector_cursor;
                     let this_batch_sectors =
                         cmp::min(batch_size_sectors as u64, remaining) as usize;
                     let abs_first_sector = resume_from_sector + global_sector_cursor;
 
-                    // Generate pattern for the whole batch at once
-                    let mut pattern_tile = alloc_buffer(block_size_usize, false);
                     let split_point = this_batch_sectors / 2;
                     for i in 0..this_batch_sectors {
                         let current_abs_sector = abs_first_sector + i as u64;
-                        if dual_pattern {
-                            if i < split_point {
-                                data_pattern_arc
-                                    .fill_block_inplace(&mut pattern_tile, current_abs_sector);
-                            } else {
-                                DataTypePattern::Random
-                                    .fill_block_inplace(&mut pattern_tile, current_abs_sector);
-                            }
+                        if dual_pattern && i >= split_point {
+                            DataTypePattern::Random
+                                .fill_block_inplace(&mut pattern_tile, current_abs_sector);
                         } else {
                             data_pattern_arc
                                 .fill_block_inplace(&mut pattern_tile, current_abs_sector);
                         }
                         let start = i * block_size_usize;
-                        let end = start + block_size_usize;
-                        target_buf[start..end].copy_from_slice(&pattern_tile);
+                        target_buf[start..start + block_size_usize]
+                            .copy_from_slice(&pattern_tile);
                     }
 
-                    req_tx
+                    if req_tx
                         .send(IoJob::WriteReadVerify {
                             abs_start_sector: abs_first_sector,
                             sector_count: this_batch_sectors,
                             buf: target_buf,
                         })
-                        .expect("worker has stopped unexpectedly");
+                        .is_err()
+                    {
+                        break;
+                    }
 
                     jobs_in_flight += 1;
                     global_sector_cursor += this_batch_sectors as u64;
+                } else {
+                    break;
                 }
             }
 
-            // Check if we should exit the loop
             if jobs_in_flight == 0 && global_sector_cursor >= total_sectors_in_test_run {
-                break 'main_loop;
+                break 'immediate_loop;
+            }
+            if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+                break 'immediate_loop;
             }
 
-            // Now, process a result.
-            // If we have no free buffers or no more work to submit, we MUST block to get one back.
-            // Otherwise, we can just poll.
-            let must_block =
-                buffer_pool.is_empty() || global_sector_cursor >= total_sectors_in_test_run;
-            let msg_opt = if must_block {
-                res_rx.recv().ok() // Block and convert to Option
-            } else {
-                match res_rx.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(crossbeam_channel::TryRecvError::Empty) => None,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        if jobs_in_flight > 0 {
-                            log_simple(
-                                &log_f_opt,
-                                Some(&pb_arc),
-                                "Result channel closed unexpectedly. Worker may have panicked.",
-                            );
-                            HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
-                        }
-                        None
-                    }
-                }
-            };
+            match res_rx.recv() {
+                Ok(msg) => {
+                    jobs_in_flight -= 1;
+                    pb_arc.inc(msg.sector_count as u64);
 
-            if let Some(msg) = msg_opt {
-                jobs_in_flight -= 1;
-                pb_arc.inc(msg.sector_count as u64);
-
-                let batch_bytes = msg.sector_count as u64 * block_size_u64;
-                let split = if dual_pattern {
-                    msg.sector_count as usize / 2
-                } else {
-                    msg.sector_count as usize
-                };
-                let first_bytes = split as u64 * block_size_u64;
-                let second_bytes = batch_bytes - first_bytes;
-
-                let write_mib_first = if msg.write_secs_first > 0.0 {
-                    (first_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs_first
-                } else {
-                    0.0
-                };
-                let read_mib_first = if msg.read_secs_first > 0.0 {
-                    (first_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs_first
-                } else {
-                    0.0
-                };
-                let write_mib_second = if dual_pattern && msg.write_secs_second > 0.0 {
-                    (second_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs_second
-                } else {
-                    0.0
-                };
-                let read_mib_second = if dual_pattern && msg.read_secs_second > 0.0 {
-                    (second_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs_second
-                } else {
-                    0.0
-                };
-                let offset_bytes = msg.abs_start_sector * block_size_u64;
-                let end_offset_bytes = offset_bytes + batch_bytes;
-                let (off_start_val, off_start_unit) = format_bytes_int(offset_bytes);
-                let (off_end_val, off_end_unit) = format_bytes_int(end_offset_bytes);
-                let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
-                let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
-                // Determine the "base" (non-dual) label once
-                let base_label = match &*data_pattern_arc {
-                    DataTypePattern::Hex => "hex",
-                    DataTypePattern::Text => "text",
-                    DataTypePattern::Binary => "binary",
-                    DataTypePattern::File(_) => "file",
-                    DataTypePattern::Random => "random",
-                };
-
-                // How many sectors make up one batch (already in scope)
-                let sectors_per_batch = batch_size_sectors as u64;
-
-                // 0-based batch number in THIS test run
-                let _batch_index = (msg.abs_start_sector - resume_from_sector) / sectors_per_batch;
-
-                // When --dual-pattern is active, each batch contains both patterns
-                let pattern_label = if dual_pattern { "dual" } else { base_label };
-
-                if dual_pattern {
-                    log_simple(
-                        &log_f_opt,
-                        Some(&pb_arc),
-                        format!(
-                            "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {} {:.0} MiB/sec … {:.0} MiB/sec | random {:.0} MiB/sec … {:.0} MiB/sec",
-                            pattern_label,
-                            base_label,
-                            write_mib_first,
-                            read_mib_first,
-                            write_mib_second,
-                            read_mib_second,
-                        ),
-                    );
-                } else {
-                    log_simple(
-                        &log_f_opt,
-                        Some(&pb_arc),
-                        format!(
-                            "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec … {:.0} MiB/sec",
-                            pattern_label,
-                            write_mib_first,
-                            read_mib_first,
-                        ),
-                    );
-                }
-
-                if let Some(e) = msg.io_error {
-                    counters_arc.increment_write_errors();
-                    counters_arc.increment_read_errors(); // An IO error can be write or read
-                    log_error(
-                        &log_f_opt,
-                        Some(&pb_arc),
-                        0,
-                        msg.abs_start_sector,
-                        "IO Error",
-                        &e.to_string(),
-                        None,
-                        None,
-                        Some(file_path_owned.clone()),
-                    );
-                } else if let Some(diff_offset) = msg.diff {
-                    counters_arc.increment_mismatches();
-                    let detail = if let (Some(exp_b), Some(act_b)) =
-                        (msg.expected_byte, msg.actual_byte)
-                    {
-                        format!(
-                            "First mismatch at byte offset {} in batch (wrote {:02X} vs read {:02X})",
-                            diff_offset, exp_b, act_b
-                        )
+                    let batch_bytes = msg.sector_count as u64 * block_size_u64;
+                    let write_mib = if msg.write_secs > 0.0 {
+                        (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.write_secs
                     } else {
-                        format!("First mismatch at byte offset {} in batch", diff_offset)
+                        0.0
                     };
-                    let expected_buf = msg.expected_byte.map(|b| [b]);
-                    let actual_buf = msg.actual_byte.map(|b| [b]);
-                    log_error(
+                    let read_mib = if msg.read_secs > 0.0 {
+                        (batch_bytes as f64 / (1024.0 * 1024.0)) / msg.read_secs
+                    } else {
+                        0.0
+                    };
+                    let base_label = match &*data_pattern_arc {
+                        DataTypePattern::Hex => "hex",
+                        DataTypePattern::Text => "text",
+                        DataTypePattern::Binary => "binary",
+                        DataTypePattern::File(_) => "file",
+                        DataTypePattern::Random => "random",
+                    };
+                    let pattern_label = if dual_pattern { "dual" } else { base_label };
+
+                    log_simple(
                         &log_f_opt,
                         Some(&pb_arc),
-                        0,
-                        msg.abs_start_sector,
-                        "Data Mismatch",
-                        &detail,
-                        expected_buf.as_ref().map(|b| b.as_slice()),
-                        actual_buf.as_ref().map(|b| b.as_slice()),
-                        Some(file_path_owned.clone()),
+                        format!(
+                            "offset {}..{}: batch {}/{} ({})  {:.0} MiB/s W, {:.0} MiB/s R",
+                            format_bytes_int(msg.abs_start_sector * block_size_u64).0,
+                            format_bytes_int((msg.abs_start_sector + msg.sector_count as u64) * block_size_u64).0,
+                            format_bytes_int(batch_bytes).0,
+                            format_bytes_int(block_size_u64).0,
+                            pattern_label,
+                            write_mib,
+                            read_mib,
+                        ),
                     );
-                }
-                // Return buffer to the pool for reuse
-                buffer_pool.push(msg.buf);
-            }
 
-            if STOP_REQUESTED.load(Ordering::SeqCst) || HAS_FATAL_ERROR.load(Ordering::SeqCst) {
-                break;
+                    if let Some(e) = msg.io_error {
+                        counters_arc.increment_write_errors();
+                        counters_arc.increment_read_errors();
+                        log_error(&log_f_opt, Some(&pb_arc), 0, msg.abs_start_sector, "IO Error", &e.to_string(), None, None, Some(file_path_owned.clone()));
+                    } else if let Some(diff_offset) = msg.diff {
+                        counters_arc.increment_mismatches();
+                        let detail = if let (Some(exp_b), Some(act_b)) = (msg.expected_byte, msg.actual_byte) {
+                            format!("First mismatch at byte offset {} in batch (wrote {:02X} vs read {:02X})", diff_offset, exp_b, act_b)
+                        } else {
+                            format!("First mismatch at byte offset {} in batch", diff_offset)
+                        };
+                        log_error(&log_f_opt, Some(&pb_arc), 0, msg.abs_start_sector, "Data Mismatch", &detail, msg.expected_byte.as_ref().map(|b| std::slice::from_ref(b)), msg.actual_byte.as_ref().map(|b| std::slice::from_ref(b)), Some(file_path_owned.clone()));
+                    }
+                    buffer_pool.push(msg.buf);
+                }
+                Err(_) => {
+                    if jobs_in_flight > 0 {
+                        log_simple(log_f_opt, Some(&pb_arc), "Result channel closed; workers may have panicked.");
+                        HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                    }
+                    break 'immediate_loop;
+                }
             }
         }
 
-        // Signal worker to terminate and wait for it
-        req_tx.send(IoJob::Terminate).ok();
-        worker.join().expect("worker thread panicked");
-    }
-    //--------------------------------------------------------------------------//
-
-    if HAS_FATAL_ERROR.load(Ordering::SeqCst) && !pb_arc.is_finished() {
-        pb_arc.abandon_with_message("Test aborted due to fatal error(s).");
-    } else if !pb_arc.is_finished() {
-        pb_arc.finish_with_message("Test scan completed.");
+        // Graceful shutdown
+        for _ in 0..num_threads {
+            req_tx.send(IoJob::Terminate).ok();
+        }
+        drop(req_tx);
+        while let Ok(msg) = res_rx.try_recv() {
+            pb_arc.inc(msg.sector_count as u64);
+        }
+        for handle in workers {
+            handle.join().expect("worker thread panicked");
+        }
+        if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+            pb_arc.abandon_with_message("Test aborted.");
+        } else {
+            pb_arc.finish_with_message("Test scan completed.");
+        }
     }
 
     let duration = start_time.elapsed();
     log_simple(
         log_f_opt,
         None,
-        format!(
-            "Full reliability test scan phase completed in {:.2?}.",
-            duration
-        ),
+        format!("Full reliability test scan phase completed in {:.2?}.", duration),
     );
     if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
         return Err(io::Error::new(
@@ -2361,6 +2695,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             resume_from_sector,
             block_size,
             threads,
+            queue_depth,
             batch_size,
             data_type,
             data_file,
@@ -2368,6 +2703,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             direct_io,
             preallocate,
             dual_pattern,
+            deferred_verify,
             passes,
         } => {
             #[cfg(feature = "direct")]
@@ -2409,12 +2745,22 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 log_simple(
                     &log_file_arc_opt,
                     None,
+                    format!("Queue Depth: {}", queue_depth),
+                );
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
                     format!("Direct I/O: {}", use_direct_io),
                 );
                 log_simple(
                     &log_file_arc_opt,
                     None,
                     format!("Preallocate: {}", preallocate),
+                );
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    format!("Deferred Verify: {}", deferred_verify),
                 );
             }
 
@@ -2503,11 +2849,13 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     resume_from_sector,
                     actual_block_size_u64,
                     threads,
+                    queue_depth,
                     pattern.clone(),
                     actual_batch_size_sectors,
                     use_direct_io,
                     preallocate,
                     dual_pattern,
+                    deferred_verify,
                     cli.verbose,
                 )?;
 
@@ -2520,7 +2868,12 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 log_simple(
                     &log_file_arc_opt,
                     None,
-                    format!("  Write/Read Errors: {}", write_errs + read_errs),
+                    format!("  Write Errors: {}", write_errs),
+                );
+                log_simple(
+                    &log_file_arc_opt,
+                    None,
+                    format!("  Read Errors: {}", read_errs),
                 );
                 log_simple(
                     &log_file_arc_opt,
