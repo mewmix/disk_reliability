@@ -1,6 +1,7 @@
 //! NOTE: This implementation requires the `aligned_vec` crate.
 //! Add the following to your Cargo.toml:
 //! aligned_vec = "0.5"
+//lib.rs
 
 use aligned_vec::AVec;
 use rand::{thread_rng, Rng};
@@ -176,10 +177,13 @@ fn run_io_phase(
 
 
 /// Execute one of the preset tests against `path`.
-pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, direct_io: bool) -> io::Result<TestResult> {
+pub fn run_lean_test<P: AsRef<Path>>(
+    path: P,
+    test: LeanTest,
+    direct_io: bool,
+    time_limit_secs: Option<u64>,
+) -> io::Result<TestResult> {
     let (block_size, queue_depth, random, label) = test.params();
-    let blocks = queue_depth * 32;
-    let total_bytes = (blocks * block_size) as u64;
 
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
@@ -199,44 +203,106 @@ pub fn run_lean_test<P: AsRef<Path>>(path: P, test: LeanTest, direct_io: bool) -
     }
 
     let file = Arc::new(options.open(&path)?);
-    file.set_len(total_bytes)?;
 
-    // --- Prepare I/O Offsets ---
-    let mut offsets = Vec::with_capacity(blocks);
-    if random {
-        let mut rng = thread_rng();
-        for _ in 0..blocks {
-            offsets.push(rng.gen_range(0..blocks) as u64 * block_size as u64);
+    if let Some(time_limit) = time_limit_secs {
+        // Time-based benchmark
+        let mut total_write_bytes = 0;
+        let mut total_read_bytes = 0;
+
+        // Write phase
+        let write_start = Instant::now();
+        while write_start.elapsed().as_secs() < time_limit {
+            let blocks = queue_depth * 32;
+            let bytes_in_batch = (blocks * block_size) as u64;
+            file.set_len(bytes_in_batch)?;
+            let mut offsets = Vec::with_capacity(blocks);
+            if random {
+                let mut rng = thread_rng();
+                for _ in 0..blocks {
+                    offsets.push(rng.gen_range(0..blocks) as u64 * block_size as u64);
+                }
+            } else {
+                for i in 0..blocks {
+                    offsets.push(i as u64 * block_size as u64);
+                }
+            }
+            run_io_phase(&file, &offsets, block_size, queue_depth, true, random)?;
+            total_write_bytes += bytes_in_batch;
         }
+        let write_secs = write_start.elapsed().as_secs_f64();
+
+        // Read phase
+        let read_start = Instant::now();
+        while read_start.elapsed().as_secs() < time_limit {
+            let blocks = queue_depth * 32;
+            let bytes_in_batch = (blocks * block_size) as u64;
+            file.set_len(bytes_in_batch)?;
+            let mut offsets = Vec::with_capacity(blocks);
+            if random {
+                let mut rng = thread_rng();
+                for _ in 0..blocks {
+                    offsets.push(rng.gen_range(0..blocks) as u64 * block_size as u64);
+                }
+            } else {
+                for i in 0..blocks {
+                    offsets.push(i as u64 * block_size as u64);
+                }
+            }
+            run_io_phase(&file, &offsets, block_size, queue_depth, false, random)?;
+            total_read_bytes += bytes_in_batch;
+        }
+        let read_secs = read_start.elapsed().as_secs_f64();
+
+        let write_mib_s = (total_write_bytes as f64 / (1024.0 * 1024.0)) / write_secs;
+        let read_mib_s = (total_read_bytes as f64 / (1024.0 * 1024.0)) / read_secs;
+
+        Ok(TestResult {
+            label,
+            bytes_processed: total_write_bytes + total_read_bytes,
+            write_seconds: write_secs,
+            read_seconds: read_secs,
+            write_mib_s,
+            read_mib_s,
+        })
     } else {
-        for i in 0..blocks {
-            offsets.push(i as u64 * block_size as u64);
+        // Original, block-based benchmark
+        let blocks = queue_depth * 32;
+        let total_bytes = (blocks * block_size) as u64;
+        file.set_len(total_bytes)?;
+
+        let mut offsets = Vec::with_capacity(blocks);
+        if random {
+            let mut rng = thread_rng();
+            for _ in 0..blocks {
+                offsets.push(rng.gen_range(0..blocks) as u64 * block_size as u64);
+            }
+        } else {
+            for i in 0..blocks {
+                offsets.push(i as u64 * block_size as u64);
+            }
         }
+
+        let start_write = Instant::now();
+        run_io_phase(&file, &offsets, block_size, queue_depth, true, random)?;
+        file.sync_all()?;
+        let write_secs = start_write.elapsed().as_secs_f64();
+
+        let start_read = Instant::now();
+        run_io_phase(&file, &offsets, block_size, queue_depth, false, random)?;
+        let read_secs = start_read.elapsed().as_secs_f64();
+
+        let write_mib_s = (total_bytes as f64 / (1024.0 * 1024.0)) / write_secs;
+        let read_mib_s = (total_bytes as f64 / (1024.0 * 1024.0)) / read_secs;
+
+        Ok(TestResult {
+            label,
+            bytes_processed: total_bytes * 2,
+            write_seconds: write_secs,
+            read_seconds: read_secs,
+            write_mib_s,
+            read_mib_s,
+        })
     }
-
-    // --- Write Phase ---
-    let start_write = Instant::now();
-    run_io_phase(&file, &offsets, block_size, queue_depth, true, random)?;
-    file.sync_all()?;
-    let write_secs = start_write.elapsed().as_secs_f64();
-
-    // --- Read Phase ---
-    let start_read = Instant::now();
-    run_io_phase(&file, &offsets, block_size, queue_depth, false, random)?;
-    let read_secs = start_read.elapsed().as_secs_f64();
-
-    let write_mib_s = (total_bytes as f64 / (1024.0 * 1024.0)) / write_secs;
-    let read_mib_s = (total_bytes as f64 / (1024.0 * 1024.0)) / read_secs;
-
-    let result = TestResult {
-        label,
-        bytes_processed: total_bytes * 2,
-        write_seconds: write_secs,
-        read_seconds: read_secs,
-        write_mib_s,
-        read_mib_s,
-    };
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -247,7 +313,7 @@ mod tests {
     #[test]
     fn json_output() {
         let tmp = NamedTempFile::new().unwrap();
-        let result = run_lean_test(tmp.path(), LeanTest::Seq1Mq1t1, false).unwrap();
+        let result = run_lean_test(tmp.path(), LeanTest::Seq1Mq1t1, false, None).unwrap();
         let v = result.to_json();
         assert_eq!(v["label"], "SEQ1M Q1T1");
         assert!(v["write_mib_s"].as_f64().unwrap() > 0.0);
@@ -257,7 +323,7 @@ mod tests {
     fn q8_runs_concurrently() {
         // This is a smoke test to ensure Q>1 doesn't crash and completes successfully.
         let tmp = NamedTempFile::new().unwrap();
-        let result = run_lean_test(tmp.path(), LeanTest::Rnd4kQ32T1, false).unwrap();
+        let result = run_lean_test(tmp.path(), LeanTest::Rnd4kQ32T1, false, None).unwrap();
         let v = result.to_json();
         assert_eq!(v["label"], "RND4K Q32T1");
         assert!(v["read_mib_s"].as_f64().unwrap() > 0.0);
@@ -271,7 +337,7 @@ mod tests {
     fn o_direct_succeeds_with_alignment() {
         let tmp = NamedTempFile::new().unwrap();
         // This will panic if the aligned allocation or I/O fails.
-        let result = run_lean_test(tmp.path(), LeanTest::Rnd4kQ1t1, true).unwrap();
+        let result = run_lean_test(tmp.path(), LeanTest::Rnd4kQ1t1, true, None).unwrap();
         assert_eq!(result.label, "RND4K Q1T1");
     }
 }

@@ -1,3 +1,4 @@
+//main.rs
 #![allow(clippy::too_many_arguments)]
 
 // Standard library imports
@@ -288,6 +289,8 @@ enum Commands {
         #[cfg(feature = "direct")]
         #[clap(long)]
         direct_io: bool,
+        #[clap(long, help = "Run benchmark for a specified duration in seconds.")]
+        time: Option<u64>,
     },
     ReadSector {
         #[clap(long)]
@@ -2570,12 +2573,11 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
         path,
         mode,
         json: true,
-        direct_io,
-    } = &cli.command
+        direct_io, time } = &cli.command
     {
         let file_path = resolve_file_path(path.clone(), &log_file_arc_opt)?;
         let test: LeanTest = mode.clone().into();
-        let result = run_lean_test(&file_path, test, *direct_io)?;
+        let result = run_lean_test(&file_path, test, *direct_io, None)?;
         println!("{}", result.to_json());
         return Ok(());
     }
@@ -2998,10 +3000,10 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 }
             }
         }
-        Commands::Bench { path, mode, json, direct_io } => {
+        Commands::Bench { path, mode, json, direct_io, time } => {
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
             let test: LeanTest = mode.into();
-            let result = run_lean_test(&file_path, test, direct_io)?;
+            let result = run_lean_test(&file_path, test, direct_io, time)?;
             if json {
                 println!("{}", result.to_json());
             } else {
