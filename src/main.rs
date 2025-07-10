@@ -24,7 +24,8 @@ use ctrlc;
 use disk_tester::{run_lean_test, LeanTest};
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
-use rand::{thread_rng, Rng};
+use rand::{Rng, SeedableRng};
+use rand::rngs::SmallRng;
 use std::ptr;
 mod hardware_info;
 #[cfg(target_os = "macos")]
@@ -126,6 +127,11 @@ enum DataTypePattern {
     Random,
 }
 
+fn fill_deterministic_random(buf: &mut [u8], sector: u64) {
+    let mut rng = SmallRng::seed_from_u64(sector);
+    rng.fill(buf);
+}
+
 impl DataTypePattern {
     fn fill_block_inplace(&self, buffer_slice: &mut [u8], offset_sector: u64) {
         let block_size = buffer_slice.len();
@@ -172,8 +178,7 @@ impl DataTypePattern {
                 }
             }
             DataTypePattern::Random => {
-                let mut rng = thread_rng();
-                rng.fill(buffer_slice);
+                fill_deterministic_random(buffer_slice, offset_sector);
             }
         }
     }
@@ -813,6 +818,15 @@ mod tests {
     }
 
     #[test]
+    fn random_pattern_is_deterministic() {
+        let mut a = [0u8; 4096];
+        let mut b = [0u8; 4096];
+        DataTypePattern::Random.fill_block_inplace(&mut a, 12345);
+        DataTypePattern::Random.fill_block_inplace(&mut b, 12345);
+        assert_eq!(a, b, "Random pattern must be deterministic per sector");
+    }
+
+    #[test]
     fn test_single_sector_write_and_read() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
@@ -838,28 +852,24 @@ mod tests {
         let pattern = DataTypePattern::Binary;
         let mut buf = vec![0u8; block_size * sectors];
         let mut tile = vec![0u8; block_size];
-        let split = sectors / 2;
         for i in 0..sectors {
             let abs = i as u64;
-            if i < split {
-                pattern.fill_block_inplace(&mut tile, abs);
-            } else {
+            if abs & 1 == 1 {
                 DataTypePattern::Random.fill_block_inplace(&mut tile, abs);
+            } else {
+                pattern.fill_block_inplace(&mut tile, abs);
             }
             let start = i * block_size;
             buf[start..start + block_size].copy_from_slice(&tile);
         }
 
-        let mut expected_first = vec![0u8; block_size];
-        pattern.fill_block_inplace(&mut expected_first, 0);
-        assert_eq!(&buf[0..block_size], &expected_first);
+        let mut expected_even = vec![0u8; block_size];
+        pattern.fill_block_inplace(&mut expected_even, 0);
+        assert_eq!(&buf[0..block_size], &expected_even);
 
-        let mut expected_second = vec![0u8; block_size];
-        pattern.fill_block_inplace(&mut expected_second, split as u64);
-        assert_ne!(
-            &buf[split * block_size..(split + 1) * block_size],
-            &expected_second
-        );
+        let mut expected_odd = vec![0u8; block_size];
+        pattern.fill_block_inplace(&mut expected_odd, 1);
+        assert_ne!(&buf[block_size..2 * block_size], &expected_odd);
     }
 }
 
@@ -1699,10 +1709,10 @@ fn full_reliability_test(
                             cmp::min(batch_size_sectors as u64, remaining) as usize;
                         let abs_first_sector = resume_from_sector + global_sector_cursor;
 
-                        let split_point = this_batch_sectors / 2;
                         for i in 0..this_batch_sectors {
                             let current_abs_sector = abs_first_sector + i as u64;
-                            if dual_pattern && i >= split_point {
+                            let use_random = dual_pattern && ((current_abs_sector & 1) != 0);
+                            if use_random {
                                 DataTypePattern::Random
                                     .fill_block_inplace(&mut pattern_tile, current_abs_sector);
                             } else {
@@ -1894,10 +1904,10 @@ fn full_reliability_test(
 
                                 if io_res.is_ok() {
                                     // Regenerate expected pattern for this batch
-                                    let split_point = sector_count / 2;
                                     for i in 0..sector_count {
                                         let current_abs_sector = abs_start_sector + i as u64;
-                                        if dual_pattern && i >= split_point {
+                                        let use_random = dual_pattern && ((current_abs_sector & 1) != 0);
+                                        if use_random {
                                             DataTypePattern::Random.fill_block_inplace(
                                                 &mut pattern_tile,
                                                 current_abs_sector,
@@ -2228,10 +2238,10 @@ fn full_reliability_test(
                         cmp::min(batch_size_sectors as u64, remaining) as usize;
                     let abs_first_sector = resume_from_sector + global_sector_cursor;
 
-                    let split_point = this_batch_sectors / 2;
                     for i in 0..this_batch_sectors {
                         let current_abs_sector = abs_first_sector + i as u64;
-                        if dual_pattern && i >= split_point {
+                        let use_random = dual_pattern && ((current_abs_sector & 1) != 0);
+                        if use_random {
                             DataTypePattern::Random
                                 .fill_block_inplace(&mut pattern_tile, current_abs_sector);
                         } else {
