@@ -19,7 +19,7 @@ use aligned_vec::AVec as AlignedVec;
 // Crates
 use chrono::Local;
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded};
 use ctrlc;
 use disk_tester::{run_lean_test, LeanTest};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -2848,7 +2848,7 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             log_simple(
                 &log_file_arc_opt,
                 None,
-                format!("\u27f3 auto-tune: threads={}  qd={}  batch={:.1} MiB",
+                format!("\u{27f3} auto-tune: threads={}  qd={}  batch={:.1} MiB",
                         threads, queue_depth, batch_bytes as f64 / 1_048_576.0)
             );
             let actual_batch_size_sectors =

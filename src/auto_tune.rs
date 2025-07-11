@@ -4,7 +4,7 @@ use crate::hardware_info::{detect_bus_type, Bus};
 use std::cmp;
 
 /// Returns `(threads, queue_depth, batch_size_bytes)`.
-pub fn decide<P: AsRef<std::path::Path>>(
+pub fn decide<P: AsRef<std::path::Path> + AsRef<std::ffi::OsStr>>(
     path: P,
     user_threads: Option<usize>,
     user_qd: Option<usize>,

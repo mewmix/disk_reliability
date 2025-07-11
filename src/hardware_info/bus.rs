@@ -18,6 +18,7 @@ pub enum Bus {
 
 #[cfg(target_os = "windows")]
 pub fn detect_bus_type<P: AsRef<std::ffi::OsStr>>(path: P) -> io::Result<Bus> {
+    use crate::serial::windows::STORAGE_DEVICE_DESCRIPTOR;
     use std::{mem, os::windows::prelude::*};
     use winapi::shared::minwindef::DWORD;
     use winapi::um::{
@@ -26,8 +27,8 @@ pub fn detect_bus_type<P: AsRef<std::ffi::OsStr>>(path: P) -> io::Result<Bus> {
         ioapiset::DeviceIoControl,
         winbase::FILE_FLAG_BACKUP_SEMANTICS,
         winioctl::{
-            IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DEVICE_DESCRIPTOR,
-            STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+            IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
+            StorageDeviceProperty,
         },
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, HANDLE},
     };
@@ -76,7 +77,7 @@ pub fn detect_bus_type<P: AsRef<std::ffi::OsStr>>(path: P) -> io::Result<Bus> {
 
     // The first byte of STORAGE_DEVICE_DESCRIPTOR after the header length
     // is *BusType* (see winioctl.h).
-    let header_len = unsafe { (*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR)).HeaderSize };
+    let header_len = unsafe { (*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR)).size };
     let bus_byte = buf[header_len as usize];
 
     let bus = match bus_byte {
