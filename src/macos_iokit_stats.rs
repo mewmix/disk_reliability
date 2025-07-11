@@ -1,3 +1,4 @@
+// src/macos_iokit_stats.rs
 //! Minimal, dependency-free SMART reader for macOS 11-14.
 //! Works for internal NVMe and SATA/USB-SATA drives that expose SMART.
 

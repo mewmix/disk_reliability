@@ -1,3 +1,4 @@
+// src/hardware_info/bus.rs
 //! Lightweight bus-type detector used by the auto-tuner.
 //!
 //! Windows  : STORAGE_QUERY_PROPERTY

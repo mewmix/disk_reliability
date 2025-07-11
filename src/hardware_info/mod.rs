@@ -1,3 +1,4 @@
+// src/hardware_info/mod.rs
 #[cfg(target_os = "macos")]
 use plist::Value;
 #[cfg(target_os = "windows")]

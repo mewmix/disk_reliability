@@ -1,3 +1,4 @@
+// src/macos_direct.rs
 //! macOS "direct I/O" shim – compiled only when the direct feature is
 //! enabled.  Uses F_NOCACHE + F_RDAHEAD to bypass the page-cache.
 

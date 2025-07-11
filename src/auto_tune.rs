@@ -1,3 +1,4 @@
+// src/auto_tune.rs
 //! Decide sensible defaults when the user did **not** override them.
 
 use crate::hardware_info::{detect_bus_type, Bus};

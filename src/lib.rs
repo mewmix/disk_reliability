@@ -1,3 +1,4 @@
+// src/lib.rs
 //! NOTE: This implementation requires the `aligned_vec` crate.
 //! Add the following to your Cargo.toml:
 //! aligned_vec = "0.5"

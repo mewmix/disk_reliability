@@ -1,3 +1,4 @@
+// src/serial.rs
 use std::{io, path::Path};
 
 #[derive(Debug, thiserror::Error)]
