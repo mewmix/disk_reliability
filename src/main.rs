@@ -19,7 +19,7 @@ use aligned_vec::AVec as AlignedVec;
 // Crates
 use chrono::Local;
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded};
 use ctrlc;
 use disk_tester::{run_lean_test, LeanTest};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -32,6 +32,7 @@ mod mac_usb_report;
 #[cfg(all(target_os = "macos", feature = "direct"))]
 mod macos_direct;
 mod serial;
+mod auto_tune;
 
 // Platform-specific imports
 #[cfg(all(target_os = "linux", feature = "direct"))]
@@ -238,20 +239,12 @@ enum Commands {
         resume_from_sector: u64,
         #[clap(long, value_parser = parse_size_with_suffix, default_value = "4K")]
         block_size: u64,
-        #[clap(
-            long,
-            default_value_t = 1,
-            help = "Number of parallel I/O worker threads."
-        )]
-        threads: usize,
-        #[clap(
-            long,
-            default_value_t = 32,
-            help = "Number of I/O batches to queue ahead (per-thread queue depth)."
-        )]
-        queue_depth: usize,
-        #[clap(long, value_parser = parse_size_with_suffix, default_value = "1M", help = "Total batch size for I/O operations (e.g., 4M, 256K).")]
-        batch_size: u64,
+        #[clap(long)]
+        threads: Option<usize>,
+        #[clap(long)]
+        queue_depth: Option<usize>,
+        #[clap(long, value_parser = parse_size_with_suffix)]
+        batch_size: Option<u64>,
         #[clap(long, value_enum, default_value = "binary")]
         data_type: DataTypeChoice,
         #[clap(long)]
@@ -2733,9 +2726,9 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
             test_size,
             resume_from_sector,
             block_size,
-            threads,
-            queue_depth,
-            batch_size,
+            threads: threads_opt,
+            queue_depth: queue_depth_opt,
+            batch_size: batch_size_opt,
             data_type,
             data_file,
             #[cfg(feature = "direct")]
@@ -2775,16 +2768,6 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                     &log_file_arc_opt,
                     None,
                     format!("Effective block size: {} bytes", actual_block_size_u64),
-                );
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
-                    format!("Worker Threads: {}", threads),
-                );
-                log_simple(
-                    &log_file_arc_opt,
-                    None,
-                    format!("Queue Depth: {}", queue_depth),
                 );
                 log_simple(
                     &log_file_arc_opt,
@@ -2854,17 +2837,22 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 );
             }
 
-            let actual_batch_size_sectors =
-                cmp::max(1, (batch_size / actual_block_size_u64) as usize);
+            // --- Auto-tune --------------------------------------------------------
+            let (threads, queue_depth, batch_bytes) = auto_tune::decide(
+                &file_path,
+                threads_opt,
+                queue_depth_opt,
+                batch_size_opt,
+                actual_block_size_u64,
+            );
             log_simple(
                 &log_file_arc_opt,
                 None,
-                format!(
-                    "Effective batch size: {} sectors ({} bytes per batch)",
-                    actual_batch_size_sectors,
-                    actual_batch_size_sectors as u64 * actual_block_size_u64
-                ),
+                format!("\u{27f3} auto-tune: threads={}  qd={}  batch={:.1} MiB",
+                        threads, queue_depth, batch_bytes as f64 / 1_048_576.0)
             );
+            let actual_batch_size_sectors =
+                cmp::max(1, (batch_bytes / actual_block_size_u64) as usize);
 
             if passes == 0 || passes > 3 {
                 let msg = format!("passes must be between 1 and 3 (got {})", passes);

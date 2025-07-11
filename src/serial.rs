@@ -58,7 +58,7 @@ mod linux {
 
 /* ---------- WINDOWS ---------- */
 #[cfg(target_os = "windows")]
-mod windows {
+pub mod windows {
     use super::*;
     use std::{mem, os::windows::prelude::*, ptr};
     use winapi::ctypes::c_void;
@@ -172,19 +172,19 @@ mod windows {
     }
 
     #[repr(C)]
-    struct STORAGE_DEVICE_DESCRIPTOR {
-        version: u32,
-        size: u32,
-        device_type: u8,
-        device_type_modifier: u8,
-        removable_media: u8,
-        command_queueing: u8,
-        vendor_id_offset: u32,
-        product_id_offset: u32,
-        product_revision_offset: u32,
-        serial_number_offset: u32,
-        bus_type: u8,
-        raw_properties_length: u32,
+    pub struct STORAGE_DEVICE_DESCRIPTOR {
+        pub version: u32,
+    pub size: u32,
+    pub device_type: u8,
+    pub device_type_modifier: u8,
+    pub removable_media: u8,
+    pub command_queueing: u8,
+    pub vendor_id_offset: u32,
+    pub product_id_offset: u32,
+    pub product_revision_offset: u32,
+    pub serial_number_offset: u32,
+    pub bus_type: u8,
+    pub raw_properties_length: u32,
         // followed by raw data
     }
 
