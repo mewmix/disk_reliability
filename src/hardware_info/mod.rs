@@ -10,8 +10,11 @@ use sysinfo::Disks;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
+pub mod bus;
+pub use bus::{Bus, detect_bus_type};
+
 #[cfg(target_os = "macos")]
-#[path = "macos_iokit_stats.rs"]
+#[path = "../macos_iokit_stats.rs"]
 mod macos_iokit_stats;
 #[cfg(target_os = "macos")]
 pub use macos_iokit_stats::smart_metrics_from_bsd as smart_metrics;
