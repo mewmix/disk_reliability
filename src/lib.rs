@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_channel::{bounded, unbounded, Receiver};
 
 // Platform-specific helpers for positioned I/O
@@ -88,7 +89,93 @@ impl TestResult {
     }
 }
 
+'''
+#[derive(Debug, Clone)]
+pub enum DataTypePattern {
+    Hex,
+    Text,
+    Binary,
+    File(Vec<u8>),
+    Random,
+}
+
+impl DataTypePattern {
+    pub fn fill_block_inplace(&self, buffer_slice: &mut [u8], offset_sector: u64) {
+        let block_size = buffer_slice.len();
+        match self {
+            DataTypePattern::Hex => {
+                let pattern = b"0123456789ABCDEF";
+                let mut tile = [0u8; 16];
+                tile.copy_from_slice(pattern);
+                let start_offset = (offset_sector as usize * 7) % pattern.len();
+                // Create a rotated tile for the specific offset
+                let mut rotated_tile = [0u8; 16];
+                rotated_tile[..(16 - start_offset)].copy_from_slice(&tile[start_offset..]);
+                rotated_tile[(16 - start_offset)..].copy_from_slice(&tile[..start_offset]);
+
+                for chunk in buffer_slice.chunks_mut(16) {
+                    let len = chunk.len();
+                    chunk.copy_from_slice(&rotated_tile[..len]);
+                }
+            }
+            DataTypePattern::Text => {
+                let sample = b"Lorem ipsum dolor sit amet. ";
+                for i in 0..block_size {
+                    buffer_slice[i] = sample[((offset_sector as usize) + i) % sample.len()];
+                }
+            }
+            DataTypePattern::Binary => {
+                let mut tile = [0u8; 256];
+                for i in 0..256 {
+                    tile[i] = i as u8;
+                }
+                let start_offset = (offset_sector as usize) % 256;
+                for (i, b_ref) in buffer_slice.iter_mut().enumerate() {
+                    *b_ref = tile[(start_offset + i) % 256];
+                }
+            }
+            DataTypePattern::File(source_buf) => {
+                if source_buf.is_empty() {
+                    buffer_slice.fill(0);
+                    return;
+                }
+                for i in 0..block_size {
+                    let source_idx = (offset_sector as usize * block_size + i) % source_buf.len();
+                    buffer_slice[i] = source_buf[source_idx];
+                }
+            }
+            DataTypePattern::Random => {
+                let mut rng = thread_rng();
+                rng.fill(buffer_slice);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ErrorCounters {
+    pub write_errors: AtomicUsize,
+    pub read_errors: AtomicUsize,
+    pub mismatches: AtomicUsize,
+}
+
+impl ErrorCounters {
+    pub fn new() -> Self {
+        Default::default()
+    }
+    pub fn increment_write_errors(&self) {
+        self.write_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn increment_read_errors(&self) {
+        self.read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn increment_mismatches(&self) {
+        self.mismatches.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Dispatches I/O jobs to a pool of worker threads.
+''
 fn run_io_phase(
     file: &Arc<File>,
     offsets: &[u64],
