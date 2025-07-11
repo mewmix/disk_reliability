@@ -2267,8 +2267,8 @@ fn full_reliability_test(
                     pb_arc.inc(msg.sector_count as u64);
                     
                     let batch_bytes = msg.sector_count as u64 * block_size_u64;
-                    let (off_start_val, off_start_unit) = format_bytes_int(msg.abs_start_sector * block_size_u64);
-                    let (off_end_val, off_end_unit) = format_bytes_int((msg.abs_start_sector + msg.sector_count as u64) * block_size_u64);
+                    let (off_start_val, off_start_unit) = format_bytes_float(msg.abs_start_sector * block_size_u64);
+                    let (off_end_val, off_end_unit) = format_bytes_float((msg.abs_start_sector + msg.sector_count as u64) * block_size_u64);
                     let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
                     let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
 
@@ -2283,11 +2283,11 @@ fn full_reliability_test(
                             &log_f_opt,
                             Some(&pb_arc),
                             format!(
-                                "{off_start_val} {off_start_unit} - \
-                                {off_end_val} {off_end_unit}: \
+                                "{off_start_val:.1} {off_start_unit} - \
+                                {off_end_val:.1} {off_end_unit}: \
                                 {batch_val} {batch_unit}/{buf_val} {buf_unit} (dual)  \
-                                binary {w0:.0} MiB/sec … {r0:.0} MiB/sec | \
-                                random {w1:.0} MiB/sec … {r1:.0} MiB/sec"
+                                binary {w0:.1} MiB/s … {r0:.1} MiB/s | \
+                                random {w1:.1} MiB/s … {r1:.1} MiB/s"
                             )
                         );
                     } else {
@@ -2304,7 +2304,7 @@ fn full_reliability_test(
                             &log_f_opt,
                             Some(&pb_arc),
                             format!(
-                                "{off_start_val} {off_start_unit} - {off_end_val} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.0} MiB/sec W, {:.0} MiB/s R",
+                                "{off_start_val:.1} {off_start_unit} - {off_end_val:.1} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {w0:.1} MiB/s W, {r0:.1} MiB/s R",
                                 base_label,
                                 w0,
                                 r0,
