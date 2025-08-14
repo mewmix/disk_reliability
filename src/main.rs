@@ -1,4 +1,3 @@
-
 // src/main.rs
 #![allow(clippy::too_many_arguments)]
 
@@ -130,6 +129,16 @@ enum DataTypePattern {
 }
 
 impl DataTypePattern {
+    fn name(&self) -> &'static str {
+        match self {
+            DataTypePattern::Hex => "hex",
+            DataTypePattern::Text => "text",
+            DataTypePattern::Binary => "binary",
+            DataTypePattern::File(_) => "file",
+            DataTypePattern::Random => "random",
+        }
+    }
+
     fn fill_block_inplace(&self, buffer_slice: &mut [u8], offset_sector: u64) {
         let block_size = buffer_slice.len();
         match self {
@@ -1231,21 +1240,45 @@ fn range_verify(
         data_pattern.fill_block_inplace(expected_buffer.as_mut_slice(), current_sector_absolute);
 
         if read_buffer.as_slice() != expected_buffer.as_slice() {
-            local_mismatches += 1;
-            counters_arc.increment_mismatches();
-            log_error(
-                log_f,
-                Some(&pb_arc),
-                0,
-                current_sector_absolute,
-                "Data Mismatch",
-                "Block content mismatch during verification",
-                Some(expected_buffer.as_slice()),
-                Some(read_buffer.as_slice()),
-                Some(file_path.to_path_buf()),
-            );
-            pb_arc.set_message(format!("{}", local_mismatches));
-        }
+    local_mismatches += 1;
+    counters_arc.increment_mismatches();
+    HAS_FATAL_ERROR.store(true, Ordering::SeqCst); // fail fast
+
+    if let Some((idx, wstart, wend)) =
+        first_diff_and_window(expected_buffer.as_slice(), read_buffer.as_slice(), 16)
+    {
+        let abs_byte_off = offset_bytes + idx as u64;
+        let detail = format!(
+            "First mismatch at absolute byte offset {} (sector {}, byte {} in sector)",
+            abs_byte_off, current_sector_absolute, idx % block_size
+        );
+        log_error(
+            log_f,
+            Some(&pb_arc),
+            0,
+            current_sector_absolute,
+            "Data Mismatch",
+            &detail,
+            Some(&expected_buffer.as_slice()[wstart..wend]),
+            Some(&read_buffer.as_slice()[wstart..wend]),
+            Some(file_path.to_path_buf()),
+        );
+    } else {
+        // Fallback (shouldn't happen): log start of blocks
+        log_error(
+            log_f,
+            Some(&pb_arc),
+            0,
+            current_sector_absolute,
+            "Data Mismatch",
+            "Block content mismatch (no index located)",
+            Some(expected_buffer.as_slice()),
+            Some(read_buffer.as_slice()),
+            Some(file_path.to_path_buf()),
+        );
+    }
+    pb_arc.set_message(format!("{}", local_mismatches));
+}
         pb_arc.inc(1);
     }
 
@@ -1396,6 +1429,16 @@ fn preallocate_file(file: &File, size: u64, log_f: &Option<Arc<Mutex<File>>>) ->
         ),
     );
     preallocate_file_os(file, size, log_f)
+}
+
+#[inline]
+fn first_diff_and_window(expected: &[u8], actual: &[u8], ctx: usize) -> Option<(usize, usize, usize)> {
+    // Returns (first_diff_idx, win_start, win_end)
+    let len = expected.len().min(actual.len());
+    let idx = expected.iter().zip(actual).position(|(a, b)| a != b)?;
+    let start = idx.saturating_sub(ctx);
+    let end = (idx + ctx + 1).min(len);
+    Some((idx, start, end))
 }
 
 #[inline]
@@ -1576,24 +1619,30 @@ fn full_reliability_test(
     );
 
     let patterns: Vec<DataTypePattern> = if dual_pattern {
-        vec![data_pattern, DataTypePattern::Random]
+        vec![DataTypePattern::Random, data_pattern]
     } else {
         vec![data_pattern]
     };
+    let patterns_arc = Arc::new(patterns);
+    
+    let start_time = Instant::now();
+    let file_path_owned = file_path.to_path_buf();
+    let pattern_names: Vec<&str> = patterns_arc.iter().map(|p| p.name()).collect();
+    log_simple(log_f_opt, None, format!("Starting test with pattern(s): {:?}", pattern_names));
 
-    for current_pattern in patterns {
-        let start_time = Instant::now();
-        let data_pattern_arc = Arc::new(current_pattern);
-        let file_path_owned = file_path.to_path_buf();
-        log_simple(log_f_opt, None, format!("Starting test with pattern: {:?}", &*data_pattern_arc));
 
-        // The main test logic is now split based on the verification strategy
-        if deferred_verify {
+    // The main test logic is now split based on the verification strategy
+    if deferred_verify {
+        // DEFERRED VERIFICATION: Write Pass -> Verify Pass for each pattern
+        // This logic remains unchanged from before, iterating through patterns at the highest level.
+        for current_pattern in &*patterns_arc {
+            log_simple(log_f_opt, None, &format!("--- Starting Deferred Test for Pattern: {} ---", current_pattern.name()));
+
             // ===============================================================
             // DEFERRED VERIFICATION: Write Pass -> Verify Pass
             // ===============================================================
             log_simple(log_f_opt, None, "--- Starting Write Pass ---");
-
+            let data_pattern_arc = Arc::new(current_pattern.clone());
             // --- WRITE PASS ---
             {
                 let pb = ProgressBar::new(total_sectors_in_test_run);
@@ -1830,6 +1879,10 @@ fn full_reliability_test(
                     diff: Option<u32>,
                     expected_byte: Option<u8>,
                     actual_byte: Option<u8>,
+                    expected_snip: Option<Vec<u8>>,
+                    actual_snip: Option<Vec<u8>>,
+                    window_start: Option<u32>,
+                    abs_byte_offset: Option<u64>,
                     io_error: Option<io::Error>,
                 }
 
@@ -1903,16 +1956,30 @@ fn full_reliability_test(
                                         }
 
                                         if expected_buf[..byte_len] != read_buf[..byte_len] {
-                                            if let Some(idx) = expected_buf
-                                                .iter()
-                                                .zip(&read_buf[..byte_len])
-                                                .position(|(a, b)| a != b)
-                                            {
-                                                diff = Some(idx as u32);
-                                                expected_b = Some(expected_buf[idx]);
-                                                actual_b = Some(read_buf[idx]);
-                                            }
-                                        }
+    if let Some((idx, wstart, wend)) =
+        first_diff_and_window(&expected_buf[..byte_len], &read_buf[..byte_len], 16)
+    {
+        diff = Some(idx as u32);
+        expected_b = Some(expected_buf[idx]);
+        actual_b = Some(read_buf[idx]);
+        let abs_off = byte_offs + idx as u64;
+        let exp_snip = expected_buf[wstart..wend].to_vec();
+        let act_snip = read_buf[wstart..wend].to_vec();
+        let _ = thread_res_tx.send(VerifyResult {
+            abs_start_sector,
+            sector_count: sector_count as u32,
+            diff,
+            expected_byte: expected_b,
+            actual_byte: actual_b,
+            expected_snip: Some(exp_snip),
+            actual_snip: Some(act_snip),
+            window_start: Some(wstart as u32),
+            abs_byte_offset: Some(abs_off),
+            io_error: None,
+        });
+        continue;
+    }
+}
                                     }
 
                                     let _ = thread_res_tx.send(VerifyResult {
@@ -1921,6 +1988,10 @@ fn full_reliability_test(
                                         diff,
                                         expected_byte: expected_b,
                                         actual_byte: actual_b,
+                                        expected_snip: None,
+                                        actual_snip: None,
+                                        window_start: None,
+                                        abs_byte_offset: None,
                                         io_error: io_res.err(),
                                     });
                                 }
@@ -1981,31 +2052,33 @@ fn full_reliability_test(
                                     Some(file_path_owned.clone()),
                                 );
                             } else if let Some(diff_offset) = msg.diff {
-                                local_mismatches += 1;
-                                counters_arc.increment_mismatches();
-                                let detail = if let (Some(exp_b), Some(act_b)) =
-                                    (msg.expected_byte, msg.actual_byte)
-                                {
-                                    format!(
-                                    "First mismatch at byte offset {} in batch (wrote {:02X} vs read {:02X})",
-                                    diff_offset, exp_b, act_b
-                                )
-                                } else {
-                                    format!("First mismatch at byte offset {} in batch", diff_offset)
-                                };
-                                log_error(
-                                    &log_f_opt,
-                                    Some(&pb_arc),
-                                    0,
-                                    msg.abs_start_sector,
-                                    "Data Mismatch",
-                                    &detail,
-                                    msg.expected_byte.as_ref().map(|b| std::slice::from_ref(b)),
-                                    msg.actual_byte.as_ref().map(|b| std::slice::from_ref(b)),
-                                    Some(file_path_owned.clone()),
-                                );
-                                pb_arc.set_message(format!("{}", local_mismatches));
-                            }
+    counters_arc.increment_mismatches();
+    HAS_FATAL_ERROR.store(true, Ordering::SeqCst); // fail fast
+
+    let detail = match (msg.expected_byte, msg.actual_byte, msg.abs_byte_offset) {
+        (Some(exp_b), Some(act_b), Some(abs_off)) =>
+            format!("First mismatch at absolute byte offset {} (batch offset {}) (wrote {:02X} vs read {:02X})",
+                    abs_off, diff_offset, exp_b, act_b),
+        _ => format!("First mismatch at batch offset {}", diff_offset),
+    };
+
+    // log a small window around the mismatch
+    let exp_win = msg.expected_snip.as_deref();
+    let act_win = msg.actual_snip.as_deref();
+
+    log_error(
+        &log_f_opt,
+        Some(&pb_arc),
+        0,
+        msg.abs_start_sector,
+        "Data Mismatch",
+        &detail,
+        exp_win,
+        act_win,
+        Some(file_path_owned.clone()),
+    );
+    pb_arc.set_message(format!("{}", counters_arc.mismatches.load(Ordering::Relaxed)));
+}
                         }
                         Err(_) => break 'verify_loop,
                     }
@@ -2034,278 +2107,307 @@ fn full_reliability_test(
                     ));
                 }
             }
-        } else {
-            // ===============================================================
-            // IMMEDIATE VERIFICATION: Write -> Read -> Verify in one loop
-            // ===============================================================
-            let pb = ProgressBar::new(total_sectors_in_test_run);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) {wide_msg}",
-                )
-                .unwrap()
-                .progress_chars("##-"),
-            );
-            let pb_arc = Arc::new(pb);
+        }
+    } else {
+        // ===============================================================
+        // IMMEDIATE VERIFICATION: Per-batch, iterate through all patterns.
+        // ===============================================================
+        let pb = ProgressBar::new(total_sectors_in_test_run);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        let pb_arc = Arc::new(pb);
 
-            enum IoJob {
-                WriteReadVerify {
-                    abs_start_sector: u64,
-                    sector_count: usize,
-                    buf: AlignedVec<u8>,
-                },
-                Terminate,
-            }
-
-            struct IoResultMsg {
+        // --- Worker Communication Structs ---
+        enum IoJob {
+            WriteReadVerify {
                 abs_start_sector: u64,
-                sector_count: u32,
-                diff: Option<u32>,
-                expected_byte: Option<u8>,
-                actual_byte: Option<u8>,
-                io_error: Option<io::Error>,
-                write_secs_first: f64,
-                read_secs_first: f64,
-                write_secs_second: f64,
-                read_secs_second: f64,
+                sector_count: usize,
                 buf: AlignedVec<u8>,
-            }
+            },
+            Terminate,
+        }
+        
+        struct MismatchInfo {
+            detail: String,
+            expected_snip: Vec<u8>,
+            actual_snip: Vec<u8>,
+        }
 
-            let (req_tx, req_rx) = bounded::<IoJob>(queue_depth);
-            let (res_tx, res_rx) = bounded::<IoResultMsg>(queue_depth);
+        struct PatternResult {
+            pattern_name: &'static str,
+            write_secs: f64,
+            read_secs: f64,
+            io_error: Option<io::Error>,
+            mismatch: Option<MismatchInfo>,
+        }
 
-            let mut workers = Vec::with_capacity(num_threads);
-            for i in 0..num_threads {
-                let worker_file_path = file_path_owned.clone();
-                let worker_log = log_f_opt.clone();
-                let worker_pb_arc = pb_arc.clone();
-                let thread_req_rx = req_rx.clone();
-                let thread_res_tx = res_tx.clone();
+        struct IoResultMsg {
+            abs_start_sector: u64,
+            sector_count: u32,
+            results: Vec<PatternResult>,
+            buf: AlignedVec<u8>,
+        }
 
-                workers.push(thread::spawn(move || {
-                    let mut f = match open_file(
-                        &worker_file_path,
-                        true,
-                        true,
-                        false,
-                        direct_io,
-                        &worker_log,
-                    ) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            log_simple(
-                                &worker_log,
-                                Some(&worker_pb_arc),
-                                format!("[Thread {}] Cannot open test file: {}", i, e),
-                            );
-                            HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    };
-                    let mut read_buf =
-                        alloc_buffer(batch_size_sectors * block_size_usize, direct_io);
+        let (req_tx, req_rx) = bounded::<IoJob>(queue_depth);
+        let (res_tx, res_rx) = bounded::<IoResultMsg>(queue_depth);
 
-                    for job in thread_req_rx.iter() {
-                        if let IoJob::WriteReadVerify {
-                            abs_start_sector,
-                            sector_count,
-                            buf,
-                        } = job
-                        {
-                            let byte_len = sector_count * block_size_usize;
-                            let byte_offs = abs_start_sector * block_size_u64;
+        // --- Worker Thread Pool ---
+        let mut workers = Vec::with_capacity(num_threads);
+        for i in 0..num_threads {
+            let worker_file_path = file_path_owned.clone();
+            let worker_log = log_f_opt.clone();
+            let worker_pb_arc = pb_arc.clone();
+            let thread_req_rx = req_rx.clone();
+            let thread_res_tx = res_tx.clone();
+            let thread_patterns_arc = patterns_arc.clone();
 
+            workers.push(thread::spawn(move || {
+                let mut f = match open_file(
+                    &worker_file_path,
+                    true,
+                    true,
+                    false,
+                    direct_io,
+                    &worker_log,
+                ) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        log_simple(
+                            &worker_log,
+                            Some(&worker_pb_arc),
+                            format!("[Thread {}] Cannot open test file: {}", i, e),
+                        );
+                        HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let mut read_buf =
+                    alloc_buffer(batch_size_sectors * block_size_usize, direct_io);
+                let mut pattern_tile = alloc_buffer(block_size_usize, false);
+
+                for job in thread_req_rx.iter() {
+                    if let IoJob::WriteReadVerify {
+                        abs_start_sector,
+                        sector_count,
+                        mut buf,
+                    } = job
+                    {
+                        let mut batch_results = Vec::new();
+                        let byte_len = sector_count * block_size_usize;
+                        let byte_offs = abs_start_sector * block_size_u64;
+
+                        // For this batch, cycle through all patterns
+                        for pattern in &*thread_patterns_arc {
+                            // 1. Fill the buffer with the current pattern
+                            for i in 0..sector_count {
+                                let current_abs_sector = abs_start_sector + i as u64;
+                                pattern.fill_block_inplace(&mut pattern_tile, current_abs_sector);
+                                let start = i * block_size_usize;
+                                buf[start..start+block_size_usize].copy_from_slice(&pattern_tile);
+                            }
+
+                            // 2. Write
                             let w_start = Instant::now();
-                            let w_res = f
-                                .seek(SeekFrom::Start(byte_offs))
+                            let w_res = f.seek(SeekFrom::Start(byte_offs))
                                 .and_then(|_| f.write_all(&buf[..byte_len]));
                             let write_secs = w_start.elapsed().as_secs_f64();
 
-                            let (r_res, read_secs) = if w_res.is_ok() {
-                                let r_start = Instant::now();
-                                let res = f
-                                    .seek(SeekFrom::Start(byte_offs))
-                                    .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
-                                (res, r_start.elapsed().as_secs_f64())
-                            } else {
-                                (Ok(()), 0.0)
-                            };
-                            let io_res = w_res.and(r_res);
+                            if let Err(e) = w_res {
+                                batch_results.push(PatternResult {
+                                    pattern_name: pattern.name(),
+                                    write_secs, read_secs: 0.0,
+                                    io_error: Some(e), mismatch: None,
+                                });
+                                break; // Stop processing patterns for this batch on I/O error
+                            }
 
-                            let mut diff = None;
-                            let mut expected_b = None;
-                            let mut actual_b = None;
-                            if io_res.is_ok() {
-                                if buf[..byte_len] != read_buf[..byte_len] {
-                                    if let Some(idx) = buf
-                                        .iter()
-                                        .zip(&read_buf[..byte_len])
-                                        .position(|(a, b)| a != b)
-                                    {
-                                        diff = Some(idx as u32);
-                                        expected_b = Some(buf[idx]);
-                                        actual_b = Some(read_buf[idx]);
-                                    }
+                            // 3. Read
+                            let r_start = Instant::now();
+                            let r_res = f.seek(SeekFrom::Start(byte_offs))
+                                .and_then(|_| f.read_exact(&mut read_buf[..byte_len]));
+                            let read_secs = r_start.elapsed().as_secs_f64();
+                            
+                            if let Err(e) = r_res {
+                                batch_results.push(PatternResult {
+                                    pattern_name: pattern.name(),
+                                    write_secs, read_secs,
+                                    io_error: Some(e), mismatch: None,
+                                });
+                                break;
+                            }
+                            
+                            // 4. Verify
+                            let mut mismatch = None;
+                            if buf[..byte_len] != read_buf[..byte_len] {
+                                if let Some((idx, wstart, wend)) = first_diff_and_window(&buf[..byte_len], &read_buf[..byte_len], 16) {
+                                    let abs_byte_off = byte_offs + idx as u64;
+                                    let detail = format!("First mismatch at absolute byte offset {} (batch offset {}) (wrote {:02X} vs read {:02X})", abs_byte_off, idx, buf[idx], read_buf[idx]);
+                                    mismatch = Some(MismatchInfo {
+                                        detail,
+                                        expected_snip: buf[wstart..wend].to_vec(),
+                                        actual_snip: read_buf[wstart..wend].to_vec(),
+                                    });
                                 }
                             }
 
-                            let _ = thread_res_tx.send(IoResultMsg {
-                                abs_start_sector,
-                                sector_count: sector_count as u32,
-                                diff,
-                                expected_byte: expected_b,
-                                actual_byte: actual_b,
-                                io_error: io_res.err(),
-                                write_secs_first: write_secs,
-                                read_secs_first: read_secs,
-                                write_secs_second: 0.0,
-                                read_secs_second: 0.0,
-                                buf,
+                            batch_results.push(PatternResult {
+                                pattern_name: pattern.name(),
+                                write_secs, read_secs, io_error: None, mismatch,
                             });
-                        } else {
-                            break;
-                        }
-                    }
-                }));
-            }
-            drop(req_rx);
-
-            let mut buffer_pool: Vec<_> = (0..queue_depth.max(2))
-                .map(|_| alloc_buffer(batch_size_sectors * block_size_usize, direct_io))
-                .collect();
-            let mut pattern_tile = alloc_buffer(block_size_usize, false);
-            let mut global_sector_cursor = 0u64;
-            let mut jobs_in_flight = 0;
-
-            'immediate_loop: loop {
-                while global_sector_cursor < total_sectors_in_test_run {
-                    if let Some(mut target_buf) = buffer_pool.pop() {
-                        let remaining = total_sectors_in_test_run - global_sector_cursor;
-                        let this_batch_sectors =
-                            cmp::min(batch_size_sectors as u64, remaining) as usize;
-                        let abs_first_sector = resume_from_sector + global_sector_cursor;
-
-                        for i in 0..this_batch_sectors {
-                            let current_abs_sector = abs_first_sector + i as u64;
-                            data_pattern_arc
-                                .fill_block_inplace(&mut pattern_tile, current_abs_sector);
-                            let start = i * block_size_usize;
-                            target_buf[start..start + block_size_usize]
-                                .copy_from_slice(&pattern_tile);
                         }
 
-                        if req_tx
-                            .send(IoJob::WriteReadVerify {
-                                abs_start_sector: abs_first_sector,
-                                sector_count: this_batch_sectors,
-                                buf: target_buf,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-
-                        jobs_in_flight += 1;
-                        global_sector_cursor += this_batch_sectors as u64;
+                        // 5. Send one aggregated result message for the entire batch
+                        let _ = thread_res_tx.send(IoResultMsg {
+                            abs_start_sector,
+                            sector_count: sector_count as u32,
+                            results: batch_results,
+                            buf,
+                        });
                     } else {
                         break;
                     }
                 }
+            }));
+        }
+        drop(req_rx);
 
-                if jobs_in_flight == 0 && global_sector_cursor >= total_sectors_in_test_run {
-                    break 'immediate_loop;
-                }
-                if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
-                    break 'immediate_loop;
-                }
+        // --- Main Thread: Producer/Consumer Loop ---
+        let mut buffer_pool: Vec<_> = (0..queue_depth.max(2))
+            .map(|_| alloc_buffer(batch_size_sectors * block_size_usize, direct_io))
+            .collect();
+        let mut global_sector_cursor = 0u64;
+        let mut jobs_in_flight = 0;
 
-                match res_rx.recv() {
-                    Ok(msg) => {
-                        jobs_in_flight -= 1;
-                        pb_arc.inc(msg.sector_count as u64);
+        'immediate_loop: loop {
+            // Producer part: Keep workers busy
+            while global_sector_cursor < total_sectors_in_test_run {
+                if let Some(buf) = buffer_pool.pop() {
+                    let remaining = total_sectors_in_test_run - global_sector_cursor;
+                    let this_batch_sectors = cmp::min(batch_size_sectors as u64, remaining) as usize;
+                    let abs_first_sector = resume_from_sector + global_sector_cursor;
+
+                    if req_tx.send(IoJob::WriteReadVerify {
+                            abs_start_sector: abs_first_sector,
+                            sector_count: this_batch_sectors,
+                            buf,
+                        }).is_err() {
+                        break;
+                    }
+                    jobs_in_flight += 1;
+                    global_sector_cursor += this_batch_sectors as u64;
+                } else {
+                    break;
+                }
+            }
+
+            if jobs_in_flight == 0 && global_sector_cursor >= total_sectors_in_test_run {
+                break 'immediate_loop;
+            }
+            if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+                break 'immediate_loop;
+            }
+
+            // Consumer part: Process results
+            match res_rx.recv() {
+                Ok(msg) => {
+                    jobs_in_flight -= 1;
+                    pb_arc.inc(msg.sector_count as u64); // Increment progress once per batch
+                    
+                    let batch_bytes = msg.sector_count as u64 * block_size_u64;
+                    let (off_start_val, off_start_unit) = format_bytes_float(msg.abs_start_sector * block_size_u64);
+                    let (batch_val, batch_unit) = format_bytes_float(batch_bytes);
+                    let (buf_val, buf_unit) = format_bytes_float(block_size_u64);
+
+                    for p_result in &msg.results {
+                        let w_perf = mib_s(batch_bytes, p_result.write_secs);
+                        let r_perf = mib_s(batch_bytes, p_result.read_secs);
                         
-                        let batch_bytes = msg.sector_count as u64 * block_size_u64;
-                        let (off_start_val, off_start_unit) = format_bytes_float(msg.abs_start_sector * block_size_u64);
-                        let (off_end_val, off_end_unit) = format_bytes_float((msg.abs_start_sector + msg.sector_count as u64) * block_size_u64);
-                        let (batch_val, batch_unit) = format_bytes_int(batch_bytes);
-                        let (buf_val, buf_unit) = format_bytes_int(block_size_u64);
-
-                        let w0 = mib_s(batch_bytes, msg.write_secs_first);
-                        let r0 = mib_s(batch_bytes, msg.read_secs_first);
-                        let base_label = match &*data_pattern_arc {
-                            DataTypePattern::Hex => "hex",
-                            DataTypePattern::Text => "text",
-                            DataTypePattern::Binary => "binary",
-                            DataTypePattern::File(_) => "file",
-                            DataTypePattern::Random => "random",
-                        };
                         log_simple(
                             &log_f_opt,
                             Some(&pb_arc),
                             format!(
-                                "{off_start_val:.1} {off_start_unit} - {off_end_val:.1} {off_end_unit}: {batch_val} {batch_unit}/{buf_val} {buf_unit} ({})  {:.1} MiB/s W, {:.1} MiB/s R",
-                                base_label,
-                                w0,
-                                r0,
+                                "{:.1} {}: {:.1} {}/{:.1} {} ({})  {:.1} MiB/s W, {:.1} MiB/s R",
+                                off_start_val, off_start_unit,
+                                batch_val, batch_unit,
+                                buf_val, buf_unit,
+                                p_result.pattern_name,
+                                w_perf,
+                                r_perf,
                             ),
                         );
 
-                        if let Some(e) = msg.io_error {
-                            counters_arc.increment_write_errors();
-                            counters_arc.increment_read_errors();
-                            log_error(&log_f_opt, Some(&pb_arc), 0, msg.abs_start_sector, "IO Error", &e.to_string(), None, None, Some(file_path_owned.clone()));
-                        } else if let Some(diff_offset) = msg.diff {
-                            counters_arc.increment_mismatches();
-                            let detail = if let (Some(exp_b), Some(act_b)) = (msg.expected_byte, msg.actual_byte) {
-                                format!("First mismatch at byte offset {} in batch (wrote {:02X} vs read {:02X})", diff_offset, exp_b, act_b)
+                        if let Some(e) = &p_result.io_error {
+                            // Determine if it was likely a write or read error for counting
+                            if p_result.read_secs == 0.0 {
+                                counters_arc.increment_write_errors();
                             } else {
-                                format!("First mismatch at byte offset {} in batch", diff_offset)
-                            };
-                            log_error(&log_f_opt, Some(&pb_arc), 0, msg.abs_start_sector, "Data Mismatch", &detail, msg.expected_byte.as_ref().map(|b| std::slice::from_ref(b)), msg.actual_byte.as_ref().map(|b| std::slice::from_ref(b)), Some(file_path_owned.clone()));
-                        }
-                        buffer_pool.push(msg.buf);
-                    }
-                    Err(_) => {
-                        if jobs_in_flight > 0 {
-                            log_simple(log_f_opt, Some(&pb_arc), "Result channel closed; workers may have panicked.");
+                                counters_arc.increment_read_errors();
+                            }
+                            log_error(&log_f_opt, Some(&pb_arc), 0, msg.abs_start_sector, "IO Error", &e.to_string(), None, None, Some(file_path_owned.clone()));
+                        } else if let Some(mismatch) = &p_result.mismatch {
+                            counters_arc.increment_mismatches();
                             HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                            log_error(
+                                &log_f_opt,
+                                Some(&pb_arc),
+                                0,
+                                msg.abs_start_sector,
+                                "Data Mismatch",
+                                &mismatch.detail,
+                                Some(&mismatch.expected_snip),
+                                Some(&mismatch.actual_snip),
+                                Some(file_path_owned.clone()),
+                            );
                         }
-                        break 'immediate_loop;
                     }
+                    buffer_pool.push(msg.buf);
+                }
+                Err(_) => {
+                    if jobs_in_flight > 0 {
+                        log_simple(log_f_opt, Some(&pb_arc), "Result channel closed; workers may have panicked.");
+                        HAS_FATAL_ERROR.store(true, Ordering::SeqCst);
+                    }
+                    break 'immediate_loop;
                 }
             }
-
-            // Graceful shutdown
-            for _ in 0..num_threads {
-                req_tx.send(IoJob::Terminate).ok();
-            }
-            drop(req_tx);
-            while let Ok(msg) = res_rx.try_recv() {
-                pb_arc.inc(msg.sector_count as u64);
-            }
-            for handle in workers {
-                handle.join().expect("worker thread panicked");
-            }
-            if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
-                pb_arc.abandon_with_message("Test aborted.");
-            } else {
-                pb_arc.finish_with_message("Test scan completed.");
-            }
         }
 
-        let duration = start_time.elapsed();
-        log_simple(
-            log_f_opt,
-            None,
-            format!("Full reliability test scan phase completed in {:.2?}.", duration),
-        );
-        if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                "Fatal error occurred in one or more threads. Check logs.",
-            ));
+        // Graceful shutdown
+        for _ in 0..num_threads {
+            req_tx.send(IoJob::Terminate).ok();
+        }
+        drop(req_tx);
+        while res_rx.try_recv().is_ok() {
+            // Drain remaining results without processing, progress already accounted for
+        }
+        for handle in workers {
+            handle.join().expect("worker thread panicked");
+        }
+        if HAS_FATAL_ERROR.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+            pb_arc.abandon_with_message("Test aborted.");
+        } else {
+            pb_arc.finish_with_message("Test scan completed.");
         }
     }
+
+    let duration = start_time.elapsed();
+    log_simple(
+        log_f_opt,
+        None,
+        format!("Full reliability test scan phase completed in {:.2?}.", duration),
+    );
+    if HAS_FATAL_ERROR.load(Ordering::SeqCst) {
+        return Err(io::Error::new(
+            ErrorKind::Other,
+            "Fatal error occurred in one or more threads. Check logs.",
+        ));
+    }
+    
     Ok(())
 }
 
