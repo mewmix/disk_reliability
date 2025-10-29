@@ -21,3 +21,23 @@ pub fn enable_nocache(file: &std::fs::File) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(not(all(target_os = "macos", feature = "direct")))]
+pub fn enable_nocache(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "direct"))]
+    fn test_enable_nocache() {
+        let tmp_file = NamedTempFile::new().unwrap();
+        let file = File::open(tmp_file.path()).unwrap();
+        assert!(enable_nocache(&file).is_ok());
+    }
+}
