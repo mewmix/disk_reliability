@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        feature: ["", "direct"]
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build
+      run: cargo build --verbose --no-default-features ${{ matrix.feature != '' && format('--features {0}', matrix.feature) || '' }}
+    - name: Run tests
+      run: cargo test --verbose --no-default-features ${{ matrix.feature != '' && format('--features {0}', matrix.feature) || '' }}

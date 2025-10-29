@@ -25,8 +25,7 @@ use ctrlc;
 use disk_tester::{run_lean_test, LeanTest};
 use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
-use rand::{thread_rng, Rng, RngCore, SeedableRng, rngs::StdRng};
-use std::ptr;
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 mod hardware_info;
 #[cfg(target_os = "macos")]
 mod mac_usb_report;
@@ -2003,7 +2002,7 @@ fn full_reliability_test(
 
                 let mut global_sector_cursor = 0u64;
                 let mut jobs_in_flight = 0;
-                let mut local_mismatches = 0;
+                let local_mismatches = 0;
 
                 'verify_loop: loop {
                     while jobs_in_flight < queue_depth
@@ -2604,12 +2603,16 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
         path,
         mode,
         json: true,
+        #[cfg(feature = "direct")]
         direct_io,
     } = &cli.command
     {
         let file_path = resolve_file_path(path.clone(), &log_file_arc_opt)?;
         let test: LeanTest = mode.clone().into();
+        #[cfg(feature = "direct")]
         let result = run_lean_test(&file_path, test, *direct_io)?;
+        #[cfg(not(feature = "direct"))]
+        let result = run_lean_test(&file_path, test, false)?;
         println!("{}", result.to_json());
         return Ok(());
     }
@@ -3027,10 +3030,13 @@ fn main_logic(log_file_arc_opt: Option<Arc<Mutex<File>>>) -> io::Result<()> {
                 }
             }
         }
-        Commands::Bench { path, mode, json, direct_io } => {
+        Commands::Bench { path, mode, json, #[cfg(feature = "direct")] direct_io } => {
             let file_path = resolve_file_path(path, &log_file_arc_opt)?;
             let test: LeanTest = mode.into();
+            #[cfg(feature = "direct")]
             let result = run_lean_test(&file_path, test, direct_io)?;
+            #[cfg(not(feature = "direct"))]
+            let result = run_lean_test(&file_path, test, false)?;
             if json {
                 println!("{}", result.to_json());
             } else {
