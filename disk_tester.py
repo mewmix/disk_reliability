@@ -7,6 +7,7 @@ import subprocess
 import json
 import shutil
 import time
+import datetime
 
 def get_platform_ioengine():
     system = platform.system()
@@ -128,7 +129,28 @@ def _escape_fio_path(path):
         return path[0] + "\\:" + path[2:]
     return path
 
-def run_fio_job(job_config, verbose=False):
+def _now_ts():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _log_line(message, log_handle=None, also_print=True):
+    line = f"[{_now_ts()}] {message}"
+    if also_print:
+        print(line)
+    if log_handle:
+        log_handle.write(line + "\n")
+        log_handle.flush()
+
+def _log_json(label, payload, log_handle=None):
+    if not log_handle:
+        return
+    try:
+        serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        serialized = json.dumps({"error": "unserializable fio json"})
+    log_handle.write(f"[{_now_ts()}] {label} {serialized}\n")
+    log_handle.flush()
+
+def run_fio_job(job_config, verbose=False, allow_errors=False):
     """
     Runs fio with the given configuration (list of arguments).
     Returns the JSON output.
@@ -145,14 +167,36 @@ def run_fio_job(job_config, verbose=False):
     # No, we need to capture stdout for JSON.
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        if allow_errors:
+            error_info = {
+                "returncode": result.returncode,
+                "stdout": _truncate(result.stdout),
+                "stderr": _truncate(result.stderr),
+            }
+            try:
+                parsed = _load_fio_json(result.stdout, result.stderr)
+                return parsed, error_info
+            except (ValueError, json.JSONDecodeError):
+                return None, error_info
         print(f"Error running fio: exit code {result.returncode}")
         print(f"Stdout: {_truncate(result.stdout)}")
         print(f"Stderr: {_truncate(result.stderr)}")
         sys.exit(1)
 
     try:
-        return _load_fio_json(result.stdout, result.stderr)
+        parsed = _load_fio_json(result.stdout, result.stderr)
+        if allow_errors:
+            return parsed, None
+        return parsed
     except (ValueError, json.JSONDecodeError) as e:
+        if allow_errors:
+            error_info = {
+                "returncode": result.returncode,
+                "stdout": _truncate(result.stdout),
+                "stderr": _truncate(result.stderr),
+                "parse_error": str(e),
+            }
+            return None, error_info
         print(f"Error parsing fio JSON output: {e}")
         print(f"Stdout (truncated): {_truncate(result.stdout)}")
         print(f"Stderr (truncated): {_truncate(result.stderr)}")
@@ -168,6 +212,8 @@ def main():
     parent_parser.add_argument('--direct', action='store_true', default=True, help="Use direct I/O (default: True)")
     parent_parser.add_argument('--no-direct', dest='direct', action='store_false', help="Disable direct I/O")
     parent_parser.add_argument('--size', help="Override test size (e.g., 1G, 500M). Default is 90%% of free space.")
+    parent_parser.add_argument('--log', default='disk_test.log', help="Log file path (default: disk_test.log)")
+    parent_parser.add_argument('--no-log', dest='log', action='store_const', const=None, help="Disable file logging")
 
     # Bench Command
     parser_bench = subparsers.add_parser('bench', parents=[parent_parser], help="Run Sequential and Random (Binary) benchmarks")
@@ -190,7 +236,13 @@ def main():
     if os.path.isdir(target_path):
         target_path = os.path.join(target_path, 'disk_test.dat')
 
-    print(f"Target: {target_path}")
+    log_handle = None
+    if args.log:
+        log_handle = open(args.log, "a", encoding="utf-8")
+
+    _log_line("Starting Disk Tester...", log_handle)
+    _log_line(f"Command: {args.command}", log_handle)
+    _log_line(f"Target: {target_path}", log_handle)
     fio_target_path = _escape_fio_path(target_path)
 
     # Calculate Size (90% of free space) or use override
@@ -198,10 +250,10 @@ def main():
     if args.size:
         # Simple parse of size suffix
         test_size_bytes = parse_size(args.size)
-        print(f"Test Size: {format_bytes(test_size_bytes)} (User Override)")
+        _log_line(f"Test Size: {format_bytes(test_size_bytes)} (User Override)", log_handle)
     else:
         test_size_bytes = get_test_size(target_path)
-        print(f"Test Size: {format_bytes(test_size_bytes)} (90% of available)")
+        _log_line(f"Test Size: {format_bytes(test_size_bytes)} (90% of available)", log_handle)
 
     # Common FIO settings
     ioengine = get_platform_ioengine()
@@ -216,39 +268,39 @@ def main():
 
     if args.command == 'bench':
         # Sequential Read
-        print("\n--- Running Sequential Read (1M) ---")
+        _log_line("Running Sequential Read (1M)", log_handle)
         job = common_args + ["--rw=read", "--bs=1M"]
         res = run_fio_job(job)
         bw = res['jobs'][0]['read']['bw'] / 1024 # MiB/s
         iops = res['jobs'][0]['read']['iops']
-        print(f"Seq Read: {bw:.2f} MiB/s, {iops:.0f} IOPS")
+        _log_line(f"Seq Read: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
         # Sequential Write
-        print("\n--- Running Sequential Write (1M) ---")
+        _log_line("Running Sequential Write (1M)", log_handle)
         job = common_args + ["--rw=write", "--bs=1M"]
         res = run_fio_job(job)
         bw = res['jobs'][0]['write']['bw'] / 1024
         iops = res['jobs'][0]['write']['iops']
-        print(f"Seq Write: {bw:.2f} MiB/s, {iops:.0f} IOPS")
+        _log_line(f"Seq Write: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
         # Random Read (Binary)
-        print("\n--- Running Random Read (4k) ---")
+        _log_line("Running Random Read (4k)", log_handle)
         job = common_args + ["--rw=randread", "--bs=4k"]
         res = run_fio_job(job)
         bw = res['jobs'][0]['read']['bw'] / 1024
         iops = res['jobs'][0]['read']['iops']
-        print(f"Rand Read: {bw:.2f} MiB/s, {iops:.0f} IOPS")
+        _log_line(f"Rand Read: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
         # Random Write (Binary)
-        print("\n--- Running Random Write (4k) ---")
+        _log_line("Running Random Write (4k)", log_handle)
         job = common_args + ["--rw=randwrite", "--bs=4k"]
         res = run_fio_job(job)
         bw = res['jobs'][0]['write']['bw'] / 1024
         iops = res['jobs'][0]['write']['iops']
-        print(f"Rand Write: {bw:.2f} MiB/s, {iops:.0f} IOPS")
+        _log_line(f"Rand Write: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
     elif args.command == 'stress':
-        print("\n--- Running Reliability Full Stress Test ---")
+        _log_line("Running Reliability Full Stress Test", log_handle)
         # Reliability: Write then Verify
         # We can use rw=write with verify=crc32c
         job = common_args + [
@@ -259,7 +311,7 @@ def main():
             "--verify_dump=1", # Dump on mismatch
             "--verify_fatal=1" # Stop on error
         ]
-        print("Writing and Verifying full test area... this may take a while.")
+        _log_line("Writing and Verifying full test area... this may take a while.", log_handle)
         # For stress test, we might want to stream output or just wait.
         # Since we use capture_output, the user won't see progress.
         # We could use a poll loop or just trust the user to wait.
@@ -271,26 +323,26 @@ def main():
 
         write_bw = res['jobs'][0]['write']['bw'] / 1024
         errs = res['jobs'][0]['error']
-        print(f"\nCompleted in {duration:.2f}s")
-        print(f"Write Speed: {write_bw:.2f} MiB/s")
-        print(f"Errors: {errs}")
+        _log_line(f"Completed in {duration:.2f}s", log_handle)
+        _log_line(f"Write Speed: {write_bw:.2f} MiB/s", log_handle)
+        _log_line(f"Errors: {errs}", log_handle)
 
         if errs == 0:
-            print("Reliability Test Passed: No errors detected.")
+            _log_line("Reliability Test Passed: No errors detected.", log_handle)
         else:
-            print("Reliability Test FAILED.")
+            _log_line("Reliability Test FAILED.", log_handle)
             sys.exit(1)
 
     elif args.command == 'temp':
-        print("\n--- Running Temperature Polling Test ---")
-        print(f"Duration: {args.duration}s, Interval: {args.interval}s")
-        print("Mode: Periodic Random/Sequential bursts to heat disk without cache exhaust.")
+        _log_line("Running Temperature Polling Test", log_handle)
+        _log_line(f"Duration: {args.duration}s, Interval: {args.interval}s", log_handle)
+        _log_line("Mode: Periodic Random/Sequential bursts to heat disk without cache exhaust.", log_handle)
 
         end_time = time.time() + args.duration
 
         while time.time() < end_time:
             cycle_start = time.time()
-            print(f"\n[Time: {time.strftime('%H:%M:%S')}] Starting Load Burst...")
+            _log_line("Starting Load Burst", log_handle)
 
             # Run short burst: 50% Random, 50% Sequential?
             # User said "random and sequential workloads".
@@ -312,22 +364,38 @@ def main():
             ]
 
             # Seq Write Burst
-            print("  > Sequential Write Burst (5s)...")
-            run_fio_job(burst_args + ["--rw=write", "--bs=1M"])
+            _log_line("Sequential Write Burst (5s)", log_handle)
+            res, err = run_fio_job(
+                burst_args + ["--rw=write", "--bs=1M"],
+                allow_errors=True
+            )
+            if res:
+                _log_json("FIO_JSON seq_write", res, log_handle)
+            if err:
+                _log_json("FIO_ERROR seq_write", err, log_handle)
 
             # Random Write Burst
-            print("  > Random Write Burst (5s)...")
-            run_fio_job(burst_args + ["--rw=randwrite", "--bs=4k"])
+            _log_line("Random Write Burst (5s)", log_handle)
+            res, err = run_fio_job(
+                burst_args + ["--rw=randwrite", "--bs=4k"],
+                allow_errors=True
+            )
+            if res:
+                _log_json("FIO_JSON rand_write", res, log_handle)
+            if err:
+                _log_json("FIO_ERROR rand_write", err, log_handle)
 
             # Wait for remainder of interval
             elapsed = time.time() - cycle_start
             sleep_time = max(0, args.interval - elapsed)
-            print(f"  > Sleeping for {sleep_time:.2f}s (Poll temp now)...")
+            _log_line(f"Sleeping for {sleep_time:.2f}s (Poll temp now)...", log_handle)
             time.sleep(sleep_time)
 
     # Cleanup (Optional? Usually testers leave the file, or clean it up. The Rust tool had a --passes option that deleted it)
     # I will leave the file for now as re-allocating 90% of disk takes time.
-    print(f"\nTest Complete. File '{target_path}' preserved for future runs.")
+    _log_line(f"Test Complete. File '{target_path}' preserved for future runs.", log_handle)
+    if log_handle:
+        log_handle.close()
 
 if __name__ == "__main__":
     main()
