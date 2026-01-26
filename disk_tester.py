@@ -31,6 +31,19 @@ def check_fio_installed():
         print("Error: 'fio' is not installed or not in PATH.")
         sys.exit(1)
 
+def get_fio_version():
+    try:
+        result = subprocess.run(
+            ["fio", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return "unknown"
+    output = (result.stdout or result.stderr or "").strip()
+    return output or "unknown"
+
 def get_test_size(path, percentage=90):
     """
     Calculates the test size.
@@ -157,6 +170,35 @@ def _log_json(label, payload, log_handle=None):
         serialized = json.dumps({"error": "unserializable fio json"})
     log_handle.write(f"[{_now_ts()}] {label} {serialized}\n")
     log_handle.flush()
+
+def _log_fio_summary(label, fio_json, log_handle=None):
+    if not fio_json:
+        return
+    try:
+        job = fio_json["jobs"][0]
+    except (KeyError, IndexError, TypeError):
+        return
+    metrics = {}
+    if "read" in job:
+        metrics["read"] = job["read"]
+    if "write" in job:
+        metrics["write"] = job["write"]
+    if not metrics:
+        return
+    for op, data in metrics.items():
+        bw_mib = data.get("bw", 0) / 1024
+        iops = data.get("iops", 0)
+        if bw_mib == 0 and iops == 0:
+            continue
+        clat_ns = data.get("clat_ns", {}).get("mean")
+        clat_ms = (clat_ns / 1_000_000) if clat_ns else None
+        if clat_ms is None:
+            _log_line(f"{label} {op}: {bw_mib:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
+        else:
+            _log_line(
+                f"{label} {op}: {bw_mib:.2f} MiB/s, {iops:.0f} IOPS, clat_avg={clat_ms:.2f} ms",
+                log_handle,
+            )
 
 def _apricorn_obj_to_dict(obj):
     if dataclasses.is_dataclass(obj):
@@ -289,8 +331,12 @@ def main():
     if args.log:
         log_handle = open(args.log, "a", encoding="utf-8")
 
-    _log_line("Starting Disk Tester...", log_handle)
-    _log_line(f"Command: {args.command}", log_handle)
+    _log_line(f"Starting {get_fio_version()}", log_handle)
+    _log_line(
+        f"Platform: {platform.system()} {platform.release()} ({platform.machine()})",
+        log_handle,
+    )
+    _log_line(f"Python: {sys.version.split()[0]}", log_handle)
     _log_line(f"Target: {target_path}", log_handle)
     if args.apricorn:
         _collect_apricorn_info(target_path, log_handle)
@@ -301,10 +347,22 @@ def main():
     if args.size:
         # Simple parse of size suffix
         test_size_bytes = parse_size(args.size)
-        _log_line(f"Test Size: {format_bytes(test_size_bytes)} (User Override)", log_handle)
+        if args.command == "temp":
+            _log_line(
+                f"Temp Region Size: {format_bytes(test_size_bytes)} (User Override, address range only)",
+                log_handle,
+            )
+        else:
+            _log_line(f"Test Size: {format_bytes(test_size_bytes)} (User Override)", log_handle)
     else:
         test_size_bytes = get_test_size(target_path)
-        _log_line(f"Test Size: {format_bytes(test_size_bytes)} (90% of available)", log_handle)
+        if args.command == "temp":
+            _log_line(
+                f"Temp Region Size: {format_bytes(test_size_bytes)} (90% of available, address range only)",
+                log_handle,
+            )
+        else:
+            _log_line(f"Test Size: {format_bytes(test_size_bytes)} (90% of available)", log_handle)
 
     # Common FIO settings
     ioengine = get_platform_ioengine()
@@ -387,7 +445,7 @@ def main():
     elif args.command == 'temp':
         _log_line("Running Temperature Polling Test", log_handle)
         _log_line(f"Duration: {args.duration}s, Interval: {args.interval}s", log_handle)
-        _log_line("Mode: Periodic Random/Sequential bursts to heat disk without cache exhaust.", log_handle)
+        _log_line("Mode: Continuous Random/Sequential read/write bursts.", log_handle)
 
         end_time = time.time() + args.duration
 
@@ -395,8 +453,7 @@ def main():
             cycle_start = time.time()
             _log_line("Starting Load Burst", log_handle)
 
-            # Run short burst: 50% Random, 50% Sequential
-        
+            # Run short burst: sequential + random, read + write.
 
             # We need to override size to be time based, or small enough.
             # Use --time_based --runtime=5
@@ -420,8 +477,21 @@ def main():
             )
             if res:
                 _log_json("FIO_JSON seq_write", res, log_handle)
+                _log_fio_summary("TEMP seq_write", res, log_handle)
             if err:
                 _log_json("FIO_ERROR seq_write", err, log_handle)
+
+            # Seq Read Burst
+            _log_line("Sequential Read Burst (5s)", log_handle)
+            res, err = run_fio_job(
+                burst_args + ["--rw=read", "--bs=1M"],
+                allow_errors=True
+            )
+            if res:
+                _log_json("FIO_JSON seq_read", res, log_handle)
+                _log_fio_summary("TEMP seq_read", res, log_handle)
+            if err:
+                _log_json("FIO_ERROR seq_read", err, log_handle)
 
             # Random Write Burst
             _log_line("Random Write Burst (5s)", log_handle)
@@ -431,14 +501,23 @@ def main():
             )
             if res:
                 _log_json("FIO_JSON rand_write", res, log_handle)
+                _log_fio_summary("TEMP rand_write", res, log_handle)
             if err:
                 _log_json("FIO_ERROR rand_write", err, log_handle)
 
-            # Wait for remainder of interval
-            elapsed = time.time() - cycle_start
-            sleep_time = max(0, args.interval - elapsed)
-            _log_line(f"Sleeping for {sleep_time:.2f}s", log_handle)
-            time.sleep(sleep_time)
+            # Random Read Burst
+            _log_line("Random Read Burst (5s)", log_handle)
+            res, err = run_fio_job(
+                burst_args + ["--rw=randread", "--bs=4k"],
+                allow_errors=True
+            )
+            if res:
+                _log_json("FIO_JSON rand_read", res, log_handle)
+                _log_fio_summary("TEMP rand_read", res, log_handle)
+            if err:
+                _log_json("FIO_ERROR rand_read", err, log_handle)
+
+            # No idle sleep; run continuously to keep the drive busy.
 
     
     _log_line(f"Test Complete. File '{target_path}' preserved for future runs.", log_handle)

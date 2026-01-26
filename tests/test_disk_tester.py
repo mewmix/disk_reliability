@@ -1,6 +1,9 @@
 import unittest
 from unittest import mock
 from collections import namedtuple
+import io
+import json
+import dataclasses
 
 import disk_tester
 
@@ -48,6 +51,86 @@ class TestDiskTester(unittest.TestCase):
             mock.patch('os.path.getsize', return_value=100), \
             mock.patch('shutil.disk_usage', return_value=usage):
             self.assertEqual(disk_tester.get_test_size('C:\\fake\\disk_test.dat'), 900)
+
+    def test_log_line_timestamp(self):
+        handle = io.StringIO()
+        with mock.patch.object(disk_tester, "_now_ts", return_value="2026-01-01 01:02:03"):
+            disk_tester._log_line("Hello", handle, also_print=False)
+        self.assertEqual(handle.getvalue(), "[2026-01-01 01:02:03] Hello\n")
+
+    def test_log_json_line(self):
+        handle = io.StringIO()
+        with mock.patch.object(disk_tester, "_now_ts", return_value="2026-01-01 01:02:03"):
+            disk_tester._log_json("FIO_JSON test", {"b": 2, "a": 1}, handle)
+        self.assertEqual(
+            handle.getvalue(),
+            "[2026-01-01 01:02:03] FIO_JSON test {\"a\":1,\"b\":2}\n"
+        )
+
+    def test_run_fio_job_allow_errors_nonzero(self):
+        result = mock.Mock(returncode=1, stdout="", stderr="boom")
+        with mock.patch('subprocess.run', return_value=result):
+            res, err = disk_tester.run_fio_job(["--rw=read"], allow_errors=True)
+        self.assertIsNone(res)
+        self.assertEqual(err["returncode"], 1)
+        self.assertEqual(err["stderr"], "boom")
+
+    def test_run_fio_job_allow_errors_parse_error(self):
+        result = mock.Mock(returncode=0, stdout="not-json", stderr="")
+        with mock.patch('subprocess.run', return_value=result):
+            res, err = disk_tester.run_fio_job(["--rw=read"], allow_errors=True)
+        self.assertIsNone(res)
+        self.assertIn("parse_error", err)
+
+    def test_run_fio_job_allow_errors_ok(self):
+        result = mock.Mock(returncode=0, stdout=json.dumps({"jobs": []}), stderr="")
+        with mock.patch('subprocess.run', return_value=result):
+            res, err = disk_tester.run_fio_job(["--rw=read"], allow_errors=True)
+        self.assertEqual(res, {"jobs": []})
+        self.assertIsNone(err)
+
+    def test_apricorn_probe_skipped_when_missing(self):
+        handle = io.StringIO()
+        with mock.patch.object(disk_tester, "USB_TOOL_AVAILABLE", False):
+            disk_tester._collect_apricorn_info("D:\\disk_test.dat", handle)
+        self.assertIn("Apricorn probe skipped: usb_tool not installed", handle.getvalue())
+
+    def test_apricorn_probe_handles_exception(self):
+        handle = io.StringIO()
+        fake_usb = mock.Mock()
+        fake_usb.find_apricorn_device.side_effect = IndexError("boom")
+        with mock.patch.object(disk_tester, "USB_TOOL_AVAILABLE", True), \
+            mock.patch.object(disk_tester, "usb_tool", fake_usb):
+            disk_tester._collect_apricorn_info("D:\\disk_test.dat", handle)
+        self.assertIn("Apricorn probe failed: boom", handle.getvalue())
+
+    def test_apricorn_probe_logs_when_none(self):
+        handle = io.StringIO()
+        fake_usb = mock.Mock()
+        fake_usb.find_apricorn_device.return_value = []
+        with mock.patch.object(disk_tester, "USB_TOOL_AVAILABLE", True), \
+            mock.patch.object(disk_tester, "usb_tool", fake_usb):
+            disk_tester._collect_apricorn_info("D:\\disk_test.dat", handle)
+        self.assertIn("Apricorn device not found", handle.getvalue())
+
+    def test_apricorn_probe_logs_json(self):
+        handle = io.StringIO()
+
+        @dataclasses.dataclass
+        class Device:
+            driveLetter: str = "D:"
+            idVendor: str = "1234"
+
+        fake_usb = mock.Mock()
+        fake_usb.find_apricorn_device.return_value = [Device()]
+        with mock.patch.object(disk_tester, "_now_ts", return_value="2026-01-01 01:02:03"), \
+            mock.patch.object(disk_tester, "USB_TOOL_AVAILABLE", True), \
+            mock.patch.object(disk_tester, "usb_tool", fake_usb):
+            disk_tester._collect_apricorn_info("D:\\disk_test.dat", handle)
+
+        log_output = handle.getvalue()
+        self.assertIn("APRICORN_INFO", log_output)
+        self.assertIn("\"target_drive\":\"D\"", log_output)
 
 
 if __name__ == '__main__':
