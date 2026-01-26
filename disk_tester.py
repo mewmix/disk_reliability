@@ -61,6 +61,73 @@ def format_bytes(size):
         count += 1
     return f"{n:.2f} {power_labels.get(count, 'P')}B"
 
+def parse_size(size_text):
+    if size_text is None:
+        raise ValueError("size_text is required")
+    s = size_text.strip().upper()
+    if not s:
+        raise ValueError("size_text is empty")
+    multiplier = 1
+    if s.endswith('G'):
+        multiplier = 1024**3
+        s = s[:-1]
+    elif s.endswith('M'):
+        multiplier = 1024**2
+        s = s[:-1]
+    elif s.endswith('K'):
+        multiplier = 1024
+        s = s[:-1]
+    try:
+        return int(float(s) * multiplier)
+    except ValueError as exc:
+        raise ValueError(f"Invalid size: {size_text}") from exc
+
+def _truncate(text, limit=2000):
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + " ... [truncated]"
+
+def _extract_json_block(text):
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start:end + 1]
+
+def _load_fio_json(stdout, stderr):
+    candidates = []
+    if stdout and stdout.strip():
+        candidates.append(("stdout", stdout))
+    if stderr and stderr.strip():
+        candidates.append(("stderr", stderr))
+
+    for _, data in candidates:
+        stripped = data.strip()
+        if not stripped:
+            continue
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            json_block = _extract_json_block(stripped)
+            if json_block:
+                try:
+                    return json.loads(json_block)
+                except json.JSONDecodeError:
+                    pass
+
+    raise ValueError("fio did not return valid JSON on stdout or stderr")
+
+def _escape_fio_path(path):
+    if platform.system() != "Windows":
+        return path
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        return path[0] + "\\:" + path[2:]
+    return path
+
 def run_fio_job(job_config, verbose=False):
     """
     Runs fio with the given configuration (list of arguments).
@@ -71,20 +138,24 @@ def run_fio_job(job_config, verbose=False):
     if verbose:
         print(f"Running command: {' '.join(cmd)}")
 
-    try:
-        # We might want to stream output if not json, but we need json for parsing.
-        # For long running jobs, we might want a progress bar.
-        # fio has --eta=always, but capturing json and eta is tricky.
-        # We'll rely on fio's own eta to stderr if we let it inherit stdout?
-        # No, we need to capture stdout for JSON.
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"Error running fio: {e}")
-        print(f"Stderr: {e.stderr}")
+    # We might want to stream output if not json, but we need json for parsing.
+    # For long running jobs, we might want a progress bar.
+    # fio has --eta=always, but capturing json and eta is tricky.
+    # We'll rely on fio's own eta to stderr if we let it inherit stdout?
+    # No, we need to capture stdout for JSON.
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error running fio: exit code {result.returncode}")
+        print(f"Stdout: {_truncate(result.stdout)}")
+        print(f"Stderr: {_truncate(result.stderr)}")
         sys.exit(1)
-    except json.JSONDecodeError as e:
+
+    try:
+        return _load_fio_json(result.stdout, result.stderr)
+    except (ValueError, json.JSONDecodeError) as e:
         print(f"Error parsing fio JSON output: {e}")
+        print(f"Stdout (truncated): {_truncate(result.stdout)}")
+        print(f"Stderr (truncated): {_truncate(result.stderr)}")
         sys.exit(1)
 
 def main():
@@ -120,20 +191,13 @@ def main():
         target_path = os.path.join(target_path, 'disk_test.dat')
 
     print(f"Target: {target_path}")
+    fio_target_path = _escape_fio_path(target_path)
 
     # Calculate Size (90% of free space) or use override
     # Note: For 'temp' test, we might not need full size, but consistent with other tests.
     if args.size:
         # Simple parse of size suffix
-        s = args.size.upper()
-        if s.endswith('G'):
-            test_size_bytes = int(float(s[:-1]) * 1024**3)
-        elif s.endswith('M'):
-            test_size_bytes = int(float(s[:-1]) * 1024**2)
-        elif s.endswith('K'):
-            test_size_bytes = int(float(s[:-1]) * 1024)
-        else:
-            test_size_bytes = int(s)
+        test_size_bytes = parse_size(args.size)
         print(f"Test Size: {format_bytes(test_size_bytes)} (User Override)")
     else:
         test_size_bytes = get_test_size(target_path)
@@ -142,7 +206,7 @@ def main():
     # Common FIO settings
     ioengine = get_platform_ioengine()
     common_args = [
-        f"--filename={target_path}",
+        f"--filename={fio_target_path}",
         f"--ioengine={ioengine}",
         f"--direct={1 if args.direct else 0}",
         f"--size={test_size_bytes}",
@@ -237,7 +301,7 @@ def main():
             # Use --time_based --runtime=5
 
             burst_args = [
-                f"--filename={target_path}",
+                f"--filename={fio_target_path}",
                 f"--ioengine={ioengine}",
                 f"--direct={1 if args.direct else 0}",
                 f"--size={test_size_bytes}", # Still define region
