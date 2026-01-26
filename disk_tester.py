@@ -8,6 +8,14 @@ import json
 import shutil
 import time
 import datetime
+import dataclasses
+
+try:
+    import usb_tool
+    USB_TOOL_AVAILABLE = True
+except Exception:
+    usb_tool = None
+    USB_TOOL_AVAILABLE = False
 
 def get_platform_ioengine():
     system = platform.system()
@@ -150,6 +158,46 @@ def _log_json(label, payload, log_handle=None):
     log_handle.write(f"[{_now_ts()}] {label} {serialized}\n")
     log_handle.flush()
 
+def _apricorn_obj_to_dict(obj):
+    if dataclasses.is_dataclass(obj):
+        return dataclasses.asdict(obj)
+    if hasattr(obj, "__dict__"):
+        return dict(obj.__dict__)
+    return {"value": str(obj)}
+
+def _collect_apricorn_info(target_path, log_handle):
+    if not USB_TOOL_AVAILABLE:
+        _log_line("Apricorn probe skipped: usb_tool not installed", log_handle)
+        return
+    try:
+        devices = usb_tool.find_apricorn_device()
+    except Exception as exc:
+        _log_line(f"Apricorn probe failed: {exc}", log_handle)
+        return
+    if not devices:
+        _log_line("Apricorn device not found", log_handle)
+        return
+
+    drive, _ = os.path.splitdrive(os.path.abspath(target_path))
+    drive_letter = drive.rstrip("\\").rstrip(":").upper()
+    matched = devices
+    if drive_letter:
+        matched = [
+            d for d in devices
+            if getattr(d, "driveLetter", "").rstrip(":").upper() == drive_letter
+        ]
+
+    payload = {
+        "target_drive": drive_letter or "N/A",
+        "devices": [_apricorn_obj_to_dict(d) for d in devices],
+    }
+    if drive_letter:
+        payload["matched_devices"] = [_apricorn_obj_to_dict(d) for d in matched]
+
+    _log_json("APRICORN_INFO", payload, log_handle)
+    if drive_letter and not matched:
+        _log_line(f"Apricorn device not matched for drive {drive_letter}", log_handle)
+
 def run_fio_job(job_config, verbose=False, allow_errors=False):
     """
     Runs fio with the given configuration (list of arguments).
@@ -214,6 +262,7 @@ def main():
     parent_parser.add_argument('--size', help="Override test size (e.g., 1G, 500M). Default is 90%% of free space.")
     parent_parser.add_argument('--log', default='disk_test.log', help="Log file path (default: disk_test.log)")
     parent_parser.add_argument('--no-log', dest='log', action='store_const', const=None, help="Disable file logging")
+    parent_parser.add_argument('--apricorn', action='store_true', help="Query Apricorn USB device info (best-effort)")
 
     # Bench Command
     parser_bench = subparsers.add_parser('bench', parents=[parent_parser], help="Run Sequential and Random (Binary) benchmarks")
@@ -243,6 +292,8 @@ def main():
     _log_line("Starting Disk Tester...", log_handle)
     _log_line(f"Command: {args.command}", log_handle)
     _log_line(f"Target: {target_path}", log_handle)
+    if args.apricorn:
+        _collect_apricorn_info(target_path, log_handle)
     fio_target_path = _escape_fio_path(target_path)
 
     # Calculate Size (90% of free space) or use override
@@ -344,10 +395,8 @@ def main():
             cycle_start = time.time()
             _log_line("Starting Load Burst", log_handle)
 
-            # Run short burst: 50% Random, 50% Sequential?
-            # User said "random and sequential workloads".
-            # We'll do a mixed workload or split.
-            # Let's do 5 seconds of Seq Write, 5 seconds of Rand Write.
+            # Run short burst: 50% Random, 50% Sequential
+        
 
             # We need to override size to be time based, or small enough.
             # Use --time_based --runtime=5
@@ -388,11 +437,10 @@ def main():
             # Wait for remainder of interval
             elapsed = time.time() - cycle_start
             sleep_time = max(0, args.interval - elapsed)
-            _log_line(f"Sleeping for {sleep_time:.2f}s (Poll temp now)...", log_handle)
+            _log_line(f"Sleeping for {sleep_time:.2f}s", log_handle)
             time.sleep(sleep_time)
 
-    # Cleanup (Optional? Usually testers leave the file, or clean it up. The Rust tool had a --passes option that deleted it)
-    # I will leave the file for now as re-allocating 90% of disk takes time.
+    
     _log_line(f"Test Complete. File '{target_path}' preserved for future runs.", log_handle)
     if log_handle:
         log_handle.close()
