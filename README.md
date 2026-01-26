@@ -1,143 +1,66 @@
-# Cross‑Platform Disk Reliability Testing Tool
+# Disk Tester (Python/FIO)
 
-A **Rust-based utility** for aggressive read/write/verify burn‑in of any block device or regular file. Runs on **Linux, macOS and Windows** and can be built with an optional *direct‑I/O* feature to bypass the page‑cache for real hardware reliability testing.
+A cross-platform disk reliability and benchmarking tool, implemented in Python using `fio` as the backend. This tool is designed to replicate and extend the functionality of the original Rust-based disk tester.
 
----
+## Features
 
-## 1  Prerequisites
+*   **Benchmark (`bench`)**: Sequential (1M) and Random (4k) Read/Write tests.
+*   **Reliability Stress (`stress`)**: Full-disk (90% capacity) sequential write with CRC32C verification.
+*   **Temperature Generation (`temp`)**: Periodic bursts of sequential and random writes to generate heat, with sleep intervals for polling temperature (without cache exhaustion).
+*   **Cross-Platform**: Supports Linux (`libaio`), Windows (`windowsaio`), and macOS (`posixaio`).
+*   **Safety**: Defaults to using 90% of available free space (or disk size) to avoid filling the disk completely.
 
-| Platform    | Requirements                                                                                                                                                        |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **All**     | *Rust 1.78+* ([https://rustup.rs](https://rustup.rs))                                                                                                               |
-| **Linux**   | glibc ≥ 2.17, permissions to open the test path in read/write mode. <br>For direct‑I/O the filesystem must accept `O_DIRECT` (ext4, xfs, btrfs, etc.).              |
-| **macOS**   | macOS 12+. Direct‑I/O not available (kernel rejects `O_DIRECT`).                                                                                                    |
-| **Windows** | Windows 10 (1903)+, MSVC build chain. For direct‑I/O the volume must be NTFS and the process must run as Administrator or have the *SeManageVolumePrivilege* right. |
+## Prerequisites
 
----
+*   Python 3.x
+*   [fio](https://github.com/axboe/fio) installed and in your system PATH.
+    *   **Linux**: `sudo apt install fio` (Debian/Ubuntu) or `sudo dnf install fio` (Fedora).
+    *   **macOS**: `brew install fio`
+    *   **Windows**: Download binary from [bluestop.org/fio](https://bluestop.org/fio/) or use WSL.
 
-## 2  Building & Installing
+## Usage
 
-### 2.1 Standard (buffered‑I/O) build
-
-```bash
-# Clone
-$ git clone https://github.com/your-org/disk‑tester.git
-$ cd disk‑tester
-
-# Release build (optimised)
-$ cargo build --release    # binary will be target/release/disk-tester
-```
-
-### 2.2 Enabling Direct I/O support
+Run the script directly:
 
 ```bash
-$ cargo build --release --features direct  # adds --direct-io flag at runtime
+chmod +x disk_tester.py
+./disk_tester.py [command] [options]
 ```
 
-> **Note**  Direct‑I/O will refuse to run if the chosen `--block-size` is not a multiple of 512 bytes or if the memory buffer is not 4096‑byte aligned (the program does this for you when built with the feature).
+### Global Options
 
-### 2.3 Install system‑wide (optional)
+*   `--path <path>`: Target file or directory. If a directory is provided, a `disk_test.dat` file is created inside. (Default: `./disk_test.dat`)
+*   `--direct` / `--no-direct`: Enable/Disable Direct I/O (Default: Enabled).
+*   `--size <size>`: Override test size (e.g., `10G`, `500M`). If not specified, uses 90% of free space.
+
+### Commands
+
+#### 1. Benchmark
+
+Runs standard sequential and random performance tests.
 
 ```bash
-$ install -Dm755 target/release/disk-tester /usr/local/bin/disk-tester   # Linux & macOS
-# Or copy .exe somewhere in %PATH% on Windows
+./disk_tester.py bench --path /mnt/nvme_drive
 ```
 
----
+#### 2. Reliability Stress Test
 
-## 3  CLI Overview
-
-The binary understands **seven** sub‑commands (run with `--help` for the full syntax):
-
-| Sub‑command    | Purpose                                                            |
-| -------------- | ------------------------------------------------------------------ |
-| `full-test`    | End‑to‑end write → read → verify of a contiguous region (default). |
-| `bench`        | Run a preset lightweight benchmark with optional JSON output. |
-| `read-sector`  | Dump a single logical sector to stdout/log.                        |
-| `write-sector` | Overwrite one sector with a chosen pattern.                        |
-| `range-read`   | Sequentially read a slice and optionally hex‑preview the data.     |
-| `range-write`  | Fill a slice with the chosen pattern.                              |
-| `verify-range` | Compare on‑disk data against an expected pattern.                  |
-
-Common flags (global or per‑command):
-
-```
---path <FILE|DIR>        Target test file or directory (default ./disk_test_file.bin)
---block-size <SIZE>      Logical sector size, accepts 4K, 1M, 512, etc. (default 4K)
---batch-size <SIZE>      Bytes processed per worker batch (default 1M)
---threads <N>            Worker thread count (default 1; I/O is single‑fd so >1 rarely helps)
---data-type <hex|text|binary|file>   Pattern generator (default binary)
---data-file <FILE>       Pattern source when --data-type file
---passes <1‑3>           Repeat full-test up to 3 times (default 1)
---resume-from-sector <S> Start offset inside existing file
---preallocate            posix_fallocate / SetFileInformationByHandle before test
---direct-io              Only present if compiled with `--features direct`
---verbose                Chatty logging
-```
-
----
-
-## 4  Quick Start Recipes
-
-### 4.1 Minimal sanity check (buffered I/O)
+Writes to the defined area and verifies data integrity using CRC32C.
 
 ```bash
-$ disk-tester full-test --test-size 2G --threads 2
+./disk_tester.py stress --path /mnt/nvme_drive
 ```
 
-### 4.2 True device write/read at 4 KiB with Direct‑I/O
+#### 3. Temperature Generation
+
+Runs periodic bursts to heat the drive.
 
 ```bash
-$ cargo build --release --features direct
-$ sudo ./target/release/disk-tester full-test \
-       --path /mnt/nvme/test.bin \
-       --block-size 4K   --batch-size 4M \
-       --test-size 10G   --direct-io --preallocate --verbose
+./disk_tester.py temp --path /mnt/nvme_drive --interval 60 --duration 3600
 ```
+*   `--interval`: Cycle time in seconds (Work + Sleep). Work is ~10s.
+*   `--duration`: Total test duration in seconds.
 
-### 4.3 Verify an existing image against a hex pattern
+## Legacy Code
 
-```bash
-$ disk-tester verify-range --path /images/firmware.img \
-       --start-sector 0 --end-sector 2048 --block-size 512 --data-type hex
-```
-
-### 4.4 Run a quick benchmark
-
-```bash
-$ disk-tester bench --path ./test.bin --mode seq1m-q8t1 --json
-```
-Outputs a JSON summary with separate read and write speeds.
-
----
-
-## 5  Logging & Output
-
-* **Progress bar** via `indicatif` (\<CTRL+C> safe).
-* **Log file** `disk_test.log` contains every message with timestamps.
-* **Test file** defaults to `disk_test_file.bin`; choose `--path` to change.
-
-Errors (read/write mismatch, seek failure, etc.) are printed in‑line and appended to the log for post‑mortem analysis. The program exits non‑zero if any fatal or verification error is encountered.
-
----
-
-## 6  Architecture Notes
-
-1. **Single FD worker** – a background thread owns the file handle, eliminating seek contention.
-2. **Ping‑pong buffer pool** – zero‑copy message passing to the worker.
-3. **Pattern engine** – deterministic hex/text/binary tile or arbitrary byte blob.
-4. **Direct‑I/O alignment** – `AlignedVec` provides 4096‑byte alignment when the `direct` feature is enabled.
-
----
-
-## 7  Known Limitations / TODO
-
-* No sparse‑file awareness: pre‑allocation equals full allocation on NTFS.
-* macOS uses F_NOCACHE + F_RDAHEAD rather than true O_DIRECT.  It still
-  bypasses the cache but may copy data one extra time in the kernel.
-* SMB/NFS mounts may reject `O_DIRECT`/`FILE_FLAG_NO_BUFFERING`.
-* No native checksum/hashing yet – mismatches are byte‑for‑byte.
-
----
-
-© 2025 Alexander Klein / License MIT
+The original Rust implementation has been moved to the `legacy_rust/` directory.

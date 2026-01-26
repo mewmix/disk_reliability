@@ -1,41 +1,5 @@
-# Ignore the target directory where Cargo builds output
-/target/
-
-# Ignore backup/temporary files
-**/*.rs.bk
-**/*~
-**/*.swp
-**/*.swo
-*.tmp
-*.log
-
-# Ignore Cargo lock file for libraries (keep it for binaries)
-# Uncomment the next line if this is a *library*, not a binary
-# Cargo.lock
-
-# Ignore IDE/editor files
-/.idea/
-/.vscode/
-/*.code-workspace
-
-# Ignore macOS system files
-.DS_Store
-
-# Ignore Windows system files
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-
-# Ignore build artifacts and logs
-*.dSYM/
-*.stackdump
-
-# Ignore by convention if using coverage or testing tools
-/coverage/
-/test-output/
-/logs/
-
-# Optional: ignore GitHub-specific cache or settings
-/.github/workflows/*.bak
-
-target
+__pycache__/
+*.pyc
+*.state
+disk_test.dat
+legacy_rust/target/
