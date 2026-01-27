@@ -64,3 +64,11 @@ Runs periodic bursts to heat the drive.
 ## Legacy Code
 
 The original Rust implementation has been moved to the `legacy_rust/` directory.
+
+## Testing
+
+Run the unit tests:
+
+```bash
+python -m unittest discover -s tests
+```
