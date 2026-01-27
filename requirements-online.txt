@@ -1,0 +1,2 @@
+# Online dependencies for disk_tester.py
+# usb_tool is intentionally excluded (not available on PyPI).

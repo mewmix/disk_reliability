@@ -1,0 +1,3 @@
+# Offline dependencies to be installed from local wheels.
+-r requirements-online.txt
+usb_tool
