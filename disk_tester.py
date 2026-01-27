@@ -25,7 +25,7 @@ def get_platform_ioengine():
     elif system == 'Windows':
         return 'windowsaio'
     else:
-        return 'posixaio' # macOS and others
+        return 'posixaio'
 
 def check_fio_installed():
     if shutil.which('fio') is None:
@@ -53,12 +53,10 @@ def get_test_size(path, percentage=90):
     Requirement: 'full disk size and set aside 10%'.
     We interpret this as 90% of *available* capacity (Free + Existing File).
     """
-    # Determine directory to check usage on
     if os.path.isdir(path):
         check_dir = path
         existing_size = 0
     else:
-        # It's a file path (existing or not)
         check_dir = os.path.dirname(os.path.abspath(path))
         if os.path.exists(path) and os.path.isfile(path):
             existing_size = os.path.getsize(path)
@@ -70,7 +68,6 @@ def get_test_size(path, percentage=90):
         sys.exit(1)
 
     usage = shutil.disk_usage(check_dir)
-    # Total available capacity for our test file is the current free space + what the file already occupies
     total_available_for_test = usage.free + existing_size
     return int(total_available_for_test * (percentage / 100.0))
 
@@ -385,11 +382,6 @@ def run_fio_job(job_config, verbose=False, allow_errors=False):
     if verbose:
         print(f"Running command: {' '.join(cmd)}")
 
-    # We might want to stream output if not json, but we need json for parsing.
-    # For long running jobs, we might want a progress bar.
-    # fio has --eta=always, but capturing json and eta is tricky.
-    # We'll rely on fio's own eta to stderr if we let it inherit stdout?
-    # No, we need to capture stdout for JSON.
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         if allow_errors:
@@ -431,7 +423,6 @@ def main():
     parser = argparse.ArgumentParser(description="Disk Tester (Python/fio)")
     subparsers = parser.add_subparsers(dest='command', required=True)
 
-    # Global arguments (can be added to parent parser)
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument('--path', default='disk_test.dat', help="Target file path (default: disk_test.dat)")
     parent_parser.add_argument('--direct', action='store_true', default=True, help="Use direct I/O (default: True)")
@@ -440,13 +431,10 @@ def main():
     parent_parser.add_argument('--log', default='disk_test.log', help="Log file path (default: disk_test.log)")
     parent_parser.add_argument('--no-log', dest='log', action='store_const', const=None, help="Disable file logging")
 
-    # Bench Command
     parser_bench = subparsers.add_parser('bench', parents=[parent_parser], help="Run Sequential and Random (Binary) benchmarks")
 
-    # Stress Command
     parser_stress = subparsers.add_parser('stress', parents=[parent_parser], help="Run Reliability Full Stress Test")
 
-    # Temp Command
     parser_temp = subparsers.add_parser('temp', parents=[parent_parser], help="Run Temperature Polling Test")
     parser_temp.add_argument('--interval', type=int, default=60, help="Cycle interval in seconds (default: 60)")
     parser_temp.add_argument('--duration', type=int, default=0, help="Total duration in seconds (0 = until failure)")
@@ -455,7 +443,6 @@ def main():
 
     check_fio_installed()
 
-    # Resolve Path
     target_path = _resolve_target_path(args.path)
 
     apricorn_result = _probe_apricorn(target_path)
@@ -517,8 +504,6 @@ def main():
                 _log_line(f"Apricorn device not matched for drive {drive_letter}", log_handle)
     fio_target_path = _escape_fio_path(target_path)
 
-    # Calculate Size (90% of free space) or use override.
-    # For 'temp' test, avoid reserving most of the device by default.
     if args.size:
         test_size_bytes = parse_size(args.size)
         if args.command == "temp":
@@ -544,7 +529,6 @@ def main():
             test_size_bytes = get_test_size(target_path)
             _log_line(f"Test Size: {format_bytes(test_size_bytes)} (90% of available)", log_handle)
 
-    # Common FIO settings
     ioengine = get_platform_ioengine()
     common_args = [
         f"--filename={fio_target_path}",
@@ -556,15 +540,13 @@ def main():
     ]
 
     if args.command == 'bench':
-        # Sequential Read
         _log_line("Running Sequential Read (1M)", log_handle)
         job = common_args + ["--rw=read", "--bs=1M"]
         res = run_fio_job(job)
-        bw = res['jobs'][0]['read']['bw'] / 1024 # MiB/s
+        bw = res['jobs'][0]['read']['bw'] / 1024
         iops = res['jobs'][0]['read']['iops']
         _log_line(f"Seq Read: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
-        # Sequential Write
         _log_line("Running Sequential Write (1M)", log_handle)
         job = common_args + ["--rw=write", "--bs=1M"]
         res = run_fio_job(job)
@@ -572,7 +554,6 @@ def main():
         iops = res['jobs'][0]['write']['iops']
         _log_line(f"Seq Write: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
-        # Random Read (Binary)
         _log_line("Running Random Read (4k)", log_handle)
         job = common_args + ["--rw=randread", "--bs=4k"]
         res = run_fio_job(job)
@@ -580,7 +561,6 @@ def main():
         iops = res['jobs'][0]['read']['iops']
         _log_line(f"Rand Read: {bw:.2f} MiB/s, {iops:.0f} IOPS", log_handle)
 
-        # Random Write (Binary)
         _log_line("Running Random Write (4k)", log_handle)
         job = common_args + ["--rw=randwrite", "--bs=4k"]
         res = run_fio_job(job)
@@ -590,22 +570,15 @@ def main():
 
     elif args.command == 'stress':
         _log_line("Running Reliability Full Stress Test", log_handle)
-        # Reliability: Write then Verify
-        # We can use rw=write with verify=crc32c
         job = common_args + [
             "--rw=write",
             "--bs=1M",
             "--verify=crc32c",
             "--do_verify=1",
-            "--verify_dump=1", # Dump on mismatch
-            "--verify_fatal=1" # Stop on error
+            "--verify_dump=1",
+            "--verify_fatal=1"
         ]
         _log_line("Writing and Verifying full test area... this may take a while.", log_handle)
-        # For stress test, we might want to stream output or just wait.
-        # Since we use capture_output, the user won't see progress.
-        # We could use a poll loop or just trust the user to wait.
-        # Given "scaffold", the original tool had a progress bar.
-        # For now, print start and wait.
         start_time = time.time()
         res = run_fio_job(job, verbose=True)
         duration = time.time() - start_time
@@ -638,23 +611,17 @@ def main():
             cycle_start = time.time()
             _log_line("Starting Load Burst", log_handle)
 
-            # Run short burst: sequential + random, read + write.
-
-            # We need to override size to be time based, or small enough.
-            # Use --time_based --runtime=5
-
             burst_args = [
                 f"--filename={fio_target_path}",
                 f"--ioengine={ioengine}",
                 f"--direct={1 if args.direct else 0}",
-                f"--size={test_size_bytes}", # Still define region
+                f"--size={test_size_bytes}",
                 "--group_reporting",
                 "--name=temp_burst",
                 "--time_based",
                 "--runtime=5"
             ]
 
-            # Seq Write Burst
             res, err = _run_temp_burst("Sequential Write", "SEQUENTIAL", burst_args, "write", "1M", log_handle)
             if err:
                 _log_line("Failure detected during seq_write.", log_handle)
@@ -663,7 +630,6 @@ def main():
                     continue
                 break
 
-            # Seq Read Burst
             res, err = _run_temp_burst("Sequential Read", "SEQUENTIAL", burst_args, "read", "1M", log_handle)
             if err:
                 _log_line("Failure detected during seq_read.", log_handle)
@@ -672,7 +638,6 @@ def main():
                     continue
                 break
 
-            # Random Write Burst
             res, err = _run_temp_burst("Random Write", "RANDOM", burst_args, "randwrite", "4k", log_handle)
             if err:
                 _log_line("Failure detected during rand_write.", log_handle)
@@ -681,7 +646,6 @@ def main():
                     continue
                 break
 
-            # Random Read Burst
             res, err = _run_temp_burst("Random Read", "RANDOM", burst_args, "randread", "4k", log_handle)
             if err:
                 _log_line("Failure detected during rand_read.", log_handle)
@@ -689,8 +653,6 @@ def main():
                 if action == "retry":
                     continue
                 break
-
-            # No idle sleep; run continuously to keep the drive busy.
 
     
     _log_line("Test Complete.", log_handle)

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 Unified chart tool:
 - Parse disk_test.log files (current Python temp summary lines or legacy Rust lines)
