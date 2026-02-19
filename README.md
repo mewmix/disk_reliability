@@ -1,74 +1,43 @@
-# Disk Tester (Python/FIO)
+# disk_reliability
 
-A cross-platform disk reliability and benchmarking tool, implemented in Python using `fio` as the backend. This tool is designed to replicate and extend the functionality of the original Rust-based disk tester.
-
-## Features
-
-*   **Benchmark (`bench`)**: Sequential (1M) and Random (4k) Read/Write tests.
-*   **Reliability Stress (`stress`)**: Full-disk (90% capacity) sequential write with CRC32C verification.
-*   **Temperature Generation (`temp`)**: Periodic bursts of sequential and random writes to generate heat, with sleep intervals for polling temperature (without cache exhaustion).
-*   **Cross-Platform**: Supports Linux (`libaio`), Windows (`windowsaio`), and macOS (`posixaio`).
-*   **Safety**: Defaults to using 90% of available free space (or disk size) to avoid filling the disk completely.
+Minimal usage for `disk_tester.py` and `plotter.py`.
 
 ## Prerequisites
 
-*   Python 3.x
-*   [fio](https://github.com/axboe/fio) installed and in your system PATH.
-    *   **Linux**: `sudo apt install fio` (Debian/Ubuntu) or `sudo dnf install fio` (Fedora).
-    *   **macOS**: `brew install fio`
-    *   **Windows**: Download binary from [bluestop.org/fio](https://bluestop.org/fio/) or use WSL.
+- Python 3.10+
+- `fio` installed and available on `PATH` (required by `disk_tester.py`)
 
-## Usage
-
-Run the script directly:
+Install Python dependencies:
 
 ```bash
-chmod +x disk_tester.py
-./disk_tester.py [command] [options]
+pip install -r requirements-online.txt
 ```
 
-### Global Options
+## 1) Run disk_tester
 
-*   `--path <path>`: Target file or directory. If a directory is provided, a `disk_test.dat` file is created inside. (Default: `./disk_test.dat`)
-*   `--direct` / `--no-direct`: Enable/Disable Direct I/O (Default: Enabled).
-*   `--size <size>`: Override test size (e.g., `10G`, `500M`). If not specified, uses 90% of free space.
-
-### Commands
-
-#### 1. Benchmark
-
-Runs standard sequential and random performance tests.
+Example (temperature workload with log output):
 
 ```bash
-./disk_tester.py bench --path /mnt/nvme_drive
+python disk_tester.py temp --path D:\ --interval 60 --duration 3600
 ```
 
-#### 2. Reliability Stress Test
+This produces a `.log` file such as `disk_test_*.log`.
 
-Writes to the defined area and verifies data integrity using CRC32C.
+## 2) Run plotter
+
+Auto mode (scan a directory for `.log` + `.TXT/.txt`, match by timestamp overlap):
 
 ```bash
-./disk_tester.py stress --path /mnt/nvme_drive
+python plotter.py --dir . --outdir plots_out
 ```
 
-#### 3. Temperature Generation
-
-Runs periodic bursts to heat the drive.
+Targeted mode (explicit files):
 
 ```bash
-./disk_tester.py temp --path /mnt/nvme_drive --interval 60 --duration 3600
+python plotter.py --log disk_test.log --txt Raw_Temp\02181235.TXT Raw_Temp\02190515.TXT --outdir plots_out
 ```
-*   `--interval`: Cycle time in seconds (Work + Sleep). Work is ~10s.
-*   `--duration`: Total test duration in seconds.
 
-## Legacy Code
+Outputs:
 
-The original Rust implementation has been moved to the `legacy_rust/` directory.
-
-## Testing
-
-Run the unit tests:
-
-```bash
-python -m unittest discover -s tests
-```
+- merged CSV: `*_merged.csv`
+- plot image: `*_temp_speed.png`
