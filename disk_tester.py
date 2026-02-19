@@ -8,15 +8,7 @@ import json
 import shutil
 import time
 import datetime
-import dataclasses
 import re
-
-try:
-    import usb_tool
-    USB_TOOL_AVAILABLE = True
-except Exception:
-    usb_tool = None
-    USB_TOOL_AVAILABLE = False
 
 def get_platform_ioengine():
     system = platform.system()
@@ -198,15 +190,6 @@ def _log_fio_summary(label, fio_json, log_handle=None):
                 log_handle,
             )
 
-def _sanitize_filename_component(value):
-    if value is None:
-        return ""
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("_")
-    return cleaned
-
-def _timestamp_for_filename():
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
 def _resolve_target_path(path):
     normalized = os.path.abspath(path)
     drive, tail = os.path.splitdrive(normalized)
@@ -278,99 +261,14 @@ def _prompt_failure_action():
         if choice in ("e", "exit"):
             return "exit"
 
-def _apricorn_obj_to_dict(obj):
-    if dataclasses.is_dataclass(obj):
-        return dataclasses.asdict(obj)
-    if isinstance(obj, dict):
-        return obj
-    if hasattr(obj, "__dict__"):
-        return dict(obj.__dict__)
-    return {"value": str(obj)}
+def _default_log_path(target_path):
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(target_path)).strip("_")
+    if not cleaned:
+        cleaned = "disk_test"
+    return f"{cleaned}_{_timestamp_for_filename()}.log"
 
-def _extract_apricorn_serial(device):
-    if device is None:
-        return None
-    for attr in ("serial", "serialNumber", "serial_number", "serialNo", "serial_no"):
-        value = getattr(device, attr, None)
-        if value:
-            return str(value)
-    data = _apricorn_obj_to_dict(device)
-    for key, value in data.items():
-        if "serial" in str(key).lower() and value:
-            return str(value)
-    return None
-
-def _extract_apricorn_firmware(device):
-    if device is None:
-        return None
-    for attr in ("firmware", "firmwareVersion", "firmware_version", "firmwareRev", "firmware_rev"):
-        value = getattr(device, attr, None)
-        if value:
-            return str(value)
-    data = _apricorn_obj_to_dict(device)
-    for key, value in data.items():
-        if "firmware" in str(key).lower() and value:
-            return str(value)
-    return None
-
-def _extract_apricorn_model(device):
-    if device is None:
-        return None
-    for attr in ("model", "modelNumber", "model_number", "product", "productName"):
-        value = getattr(device, attr, None)
-        if value:
-            return str(value)
-    data = _apricorn_obj_to_dict(device)
-    for key, value in data.items():
-        if "model" in str(key).lower() and value:
-            return str(value)
-    return None
-
-def _is_unknown_value(value):
-    if value is None:
-        return True
-    text = str(value).strip()
-    return not text or text.lower() in ("n/a", "na", "none", "unknown")
-
-def _probe_apricorn(target_path):
-    if not USB_TOOL_AVAILABLE:
-        return None
-    try:
-        devices = usb_tool.find_apricorn_device()
-    except Exception as exc:
-        return {"status": "error", "message": f"Apricorn probe failed: {exc}"}
-    if not devices:
-        return {"status": "not_found", "message": "Apricorn device not found"}
-
-    drive, _ = os.path.splitdrive(os.path.abspath(target_path))
-    drive_letter = drive.rstrip("\\").rstrip(":").upper()
-    matched = devices
-    if drive_letter:
-        matched = [
-            d for d in devices
-            if getattr(d, "driveLetter", "").rstrip(":").upper() == drive_letter
-        ]
-
-    payload = {
-        "target_drive": drive_letter or "N/A",
-        "devices": [_apricorn_obj_to_dict(d) for d in devices],
-    }
-    if drive_letter:
-        payload["matched_devices"] = [_apricorn_obj_to_dict(d) for d in matched]
-
-    serial = None
-    if matched:
-        serial = _extract_apricorn_serial(matched[0])
-    if not serial:
-        serial = _extract_apricorn_serial(devices[0])
-
-    return {
-        "status": "ok",
-        "payload": payload,
-        "drive_letter": drive_letter,
-        "matched": matched,
-        "serial": serial,
-    }
+def _timestamp_for_filename():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def run_fio_job(job_config, verbose=False, allow_errors=False):
     """
@@ -428,12 +326,13 @@ def main():
     parent_parser.add_argument('--direct', action='store_true', default=True, help="Use direct I/O (default: True)")
     parent_parser.add_argument('--no-direct', dest='direct', action='store_false', help="Disable direct I/O")
     parent_parser.add_argument('--size', help="Override test size (e.g., 1G, 500M). Default is 90%% of free space.")
-    parent_parser.add_argument('--log', default='disk_test.log', help="Log file path (default: disk_test.log)")
+    parent_parser.add_argument(
+        '--log',
+        default='disk_test.log',
+        help="Log file path (default: derived from target path name)"
+    )
     parent_parser.add_argument('--no-log', dest='log', action='store_const', const=None, help="Disable file logging")
 
-    parser_bench = subparsers.add_parser('bench', parents=[parent_parser], help="Run Sequential and Random (Binary) benchmarks")
-
-    parser_stress = subparsers.add_parser('stress', parents=[parent_parser], help="Run Reliability Full Stress Test")
 
     parser_temp = subparsers.add_parser('temp', parents=[parent_parser], help="Run Temperature Polling Test")
     parser_temp.add_argument('--interval', type=int, default=60, help="Cycle interval in seconds (default: 60)")
@@ -445,15 +344,10 @@ def main():
 
     target_path = _resolve_target_path(args.path)
 
-    apricorn_result = _probe_apricorn(target_path)
-
     log_handle = None
     log_path = args.log
-    if log_path and apricorn_result and apricorn_result.get("status") == "ok":
-        serial = _sanitize_filename_component(apricorn_result.get("serial"))
-        if serial:
-            base, ext = os.path.splitext(log_path)
-            log_path = f"{base}_{serial}_{_timestamp_for_filename()}{ext}"
+    if log_path == "disk_test.log":
+        log_path = _default_log_path(target_path)
     if log_path:
         log_handle = open(log_path, "a", encoding="utf-8")
 
@@ -474,34 +368,6 @@ def main():
             )
     except Exception as exc:
         _log_line(f"Capacity probe failed: {exc}", log_handle)
-    if apricorn_result:
-        status = apricorn_result.get("status")
-        if status == "error":
-            _log_line(apricorn_result.get("message", "Apricorn probe failed"), log_handle)
-        elif status == "not_found":
-            _log_line(apricorn_result.get("message", "Apricorn device not found"), log_handle)
-        elif status == "ok":
-            device = None
-            matched = apricorn_result.get("matched") or []
-            if matched:
-                device = matched[0]
-            else:
-                devices = apricorn_result.get("payload", {}).get("devices") or []
-                if devices:
-                    device = devices[0]
-            serial = _extract_apricorn_serial(device)
-            firmware = _extract_apricorn_firmware(device)
-            model = _extract_apricorn_model(device)
-            if not _is_unknown_value(serial):
-                _log_line(f"Apricorn DUT Serial = {serial}", log_handle)
-            if not _is_unknown_value(firmware):
-                _log_line(f"Apricorn DUT Firmware = {firmware}", log_handle)
-            if not _is_unknown_value(model):
-                _log_line(f"Apricorn DUT Model = {model}", log_handle)
-            _log_json("APRICORN_INFO", apricorn_result.get("payload"), log_handle)
-            drive_letter = apricorn_result.get("drive_letter")
-            if drive_letter and not matched:
-                _log_line(f"Apricorn device not matched for drive {drive_letter}", log_handle)
     fio_target_path = _escape_fio_path(target_path)
 
     if args.size:
